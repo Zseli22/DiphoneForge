@@ -1,0 +1,17 @@
+{
+  "_comment": "Common two-consonant syllable onsets for US English in eSpeak notation. Each cluster is a list of two consonant phones.",
+  "clusters": [
+    ["b", "l"], ["b", "r"],
+    ["k", "l"], ["k", "r"], ["k", "w"],
+    ["g", "l"], ["g", "r"],
+    ["p", "l"], ["p", "r"],
+    ["f", "l"], ["f", "r"],
+    ["d", "r"], ["d", "w"],
+    ["t", "r"], ["t", "w"],
+    ["s", "t"], ["s", "p"], ["s", "k"],
+    ["s", "l"], ["s", "m"], ["s", "n"], ["s", "w"],
+    ["s", "f"], ["s", "T"],
+    ["S", "r"], ["S", "l"],
+    ["T", "r"]
+  ]
+}

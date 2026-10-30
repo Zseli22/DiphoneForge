@@ -1,0 +1,13 @@
+{
+  "database": "C:\\Users\\vangi\\Downloads\\New Folder\\output\\mbrola_db\\usd16t_pilot\\usd16t_pilot",
+  "name": "usd16t_pilot",
+  "rate": 16000,
+  "units": 118,
+  "natural": 8,
+  "edge": 94,
+  "fallback": 16,
+  "failures": 0,
+  "db_bytes": 510632,
+  "gain": 3.475402351856122,
+  "elapsed_s": 10.4
+}

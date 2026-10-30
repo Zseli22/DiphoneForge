@@ -1,0 +1,270 @@
+﻿# -*- coding: UTF-8 -*-
+# A part of NonVisual Desktop Access (NVDA)
+# Copyright (C) 2007-2024 NV Access Limited, Peter Vágner, Aleksey Sadovoy, Leonard de Ruijter and Felipe Porciuncula Zanabria
+# This file is covered by the GNU General Public License.
+# See the file COPYING for more details.
+
+import os
+from collections import OrderedDict
+from typing import (
+	Dict,
+	List,
+	Optional,
+	Set,
+)
+
+from . import _espeak_mb
+import languageHandler
+from synthDriverHandler import SynthDriver, VoiceInfo, synthIndexReached, synthDoneSpeaking
+import speech
+from logHandler import log
+
+from speech.types import SpeechSequence
+from speech.commands import (
+	IndexCommand,
+	CharacterModeCommand,
+	BreakCommand,
+	PitchCommand,
+	RateCommand,
+	VolumeCommand,
+	LangChangeCommand,
+	PhonemeCommand,
+)
+
+class SynthDriver(SynthDriver):
+	name = "espeakwithmbrola"
+	description = "espeak with mbrola"
+
+	supportedSettings=(
+		SynthDriver.VoiceSetting(),
+		SynthDriver.RateSetting(),
+		SynthDriver.RateBoostSetting(),
+		SynthDriver.PitchSetting(),
+		SynthDriver.InflectionSetting(),
+		SynthDriver.VolumeSetting(),
+	)
+	supportedCommands = {
+		IndexCommand,
+		CharacterModeCommand,
+		BreakCommand,
+		PitchCommand,
+		RateCommand,
+		VolumeCommand,
+		PhonemeCommand,
+	}
+	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
+
+	@classmethod
+	def check(cls):
+		return True
+
+	def __init__(self):
+		_espeak_mb.initialize(self._onIndexReached)
+		log.info("Using eSpeak with Mbrola version %s" % _espeak_mb.info())
+		lang=languageHandler.getLanguage()
+		try:
+			_espeak_mb.setVoiceByLanguage(lang)
+			self._language=lang
+		except RuntimeError:
+			_espeak_mb.setVoiceByLanguage('en')
+			self._language= 'en'
+		self.rate=30
+		self.pitch=50
+		self.inflection=50
+
+	def _get_language(self):
+		return self._language
+
+	PROSODY_ATTRS = {
+		PitchCommand: "pitch",
+		VolumeCommand: "volume",
+		RateCommand: "rate",
+	}
+
+	IPA_to_espeak = {
+		u"θ": u"T",
+		u"s": u"s",
+		u"ˈ": u"'",
+	}
+
+	def _processText(self, text):
+		# We need to make several replacements.
+		return text.translate({
+			0x1: None, # used for embedded commands
+			0x3C: u"&lt;", # <: because of XML
+			0x3E: u"&gt;", # >: because of XML
+			0x5B: u" [", # [: [[ indicates phonemes
+		})
+
+
+	# C901 'speak' is too complex
+	# Note: when working on speak, look for opportunities to simplify
+	# and move logic out into smaller helper functions.
+	def speak(self, speechSequence: SpeechSequence):  # noqa: C901
+		textList: List[str] = []
+		prosody: Dict[str, int] = {}
+		indexes: List[int] = []
+		# We output malformed XML, as we might close an outer tag after opening an inner one; e.g.
+		# <voice><prosody></voice></prosody>.
+		# However, eSpeak doesn't seem to mind.
+		for item in speechSequence:
+			if isinstance(item,str):
+				textList.append(self._processText(item))
+			elif isinstance(item, IndexCommand):
+				textList.append("<mark name=\"%d\" />"%item.index)
+				indexes.append(item.index)
+			elif isinstance(item, CharacterModeCommand):
+				textList.append("<say-as interpret-as=\"characters\">" if item.state else "</say-as>")
+			elif isinstance(item, LangChangeCommand):
+				continue
+			elif isinstance(item, BreakCommand):
+				textList.append(f'<break time="{item.time}ms" />')
+			elif type(item) in self.PROSODY_ATTRS:
+				if prosody:
+					# Close previous prosody tag.
+					textList.append("</prosody>")
+				attr=self.PROSODY_ATTRS[type(item)]
+				if item.multiplier==1:
+					# Returning to normal.
+					try:
+						del prosody[attr]
+					except KeyError:
+						pass
+				else:
+					prosody[attr]=int(item.multiplier* 100)
+				if not prosody:
+					continue
+				textList.append("<prosody")
+				for attr,val in prosody.items():
+					textList.append(' %s="%d%%"'%(attr,val))
+				textList.append(">")
+			elif isinstance(item, PhonemeCommand):
+				# We can't use str.translate because we want to reject unknown characters.
+				try:
+					phonemes="".join([self.IPA_to_espeak[char] for char in item.ipa])
+					# There needs to be a space after the phoneme command.
+					# Otherwise, eSpeak will announce a subsequent SSML tag instead of processing it.
+					textList.append(u"[[%s]] "%phonemes)
+				except KeyError:
+					log.debugWarning("Unknown character in IPA string: %s"%item.ipa)
+					if item.text:
+						textList.append(self._processText(item.text))
+			else:
+				log.error("Unknown speech: %s"%item)
+		if prosody:
+			textList.append("</prosody>")
+		text=u"".join(textList)
+		_espeak_mb.speak(text, indexes)
+
+	def cancel(self):
+		_espeak_mb.stop()
+
+	def pause(self,switch):
+		_espeak_mb.pause(switch)
+
+	_rateBoost = False
+	RATE_BOOST_MULTIPLIER = 1.5
+
+	def _get_rateBoost(self):
+		return self._rateBoost
+
+	def _set_rateBoost(self, enable):
+		if enable == self._rateBoost:
+			return
+		rate = self.rate
+		self._rateBoost = enable
+		self.rate = rate
+
+	def _targetFromRate(self, rate):
+		rate = max(0, min(100, rate))
+		if rate <= 40:
+			return int(round(80 + rate * (250 - 80) / 40))
+		return int(round(250 + (rate - 40) * (610 - 250) / 60))
+
+	def _rateFromTarget(self, target):
+		if target <= 250:
+			rate = (target - 80) * 40 / (250 - 80)
+		else:
+			rate = 40 + (target - 250) * 60 / (610 - 250)
+		return max(0, min(100, int(round(rate))))
+
+	def _get_rate(self):
+		target = _espeak_mb.getParameter(_espeak_mb.espeakRATE, 1)
+		if self._rateBoost:
+			target = int(target / self.RATE_BOOST_MULTIPLIER)
+		return self._rateFromTarget(target)
+
+	def _set_rate(self, rate):
+		target = self._targetFromRate(int(rate))
+		if self._rateBoost:
+			target = int(target * self.RATE_BOOST_MULTIPLIER)
+		_espeak_mb.setParameter(_espeak_mb.espeakRATE, target, 0)
+
+	def _get_pitch(self):
+		val=_espeak_mb.getParameter(_espeak_mb.espeakPITCH,1)
+		return self._paramToPercent(val,_espeak_mb.minPitch,_espeak_mb.maxPitch)
+
+	def _set_pitch(self,pitch):
+		val=self._percentToParam(pitch, _espeak_mb.minPitch, _espeak_mb.maxPitch)
+		_espeak_mb.setParameter(_espeak_mb.espeakPITCH,val,0)
+
+	def _get_inflection(self):
+		val=_espeak_mb.getParameter(_espeak_mb.espeakRANGE,1)
+		return self._paramToPercent(val,_espeak_mb.minPitch,_espeak_mb.maxPitch)
+
+	def _set_inflection(self,val):
+		val=self._percentToParam(val, _espeak_mb.minPitch, _espeak_mb.maxPitch)
+		_espeak_mb.setParameter(_espeak_mb.espeakRANGE,val,0)
+
+	def _get_volume(self) -> int:
+		return _espeak_mb.getParameter(_espeak_mb.espeakVOLUME,1)
+
+	def _set_volume(self, volume: int):
+		_espeak_mb.setParameter(_espeak_mb.espeakVOLUME,volume,0)
+
+	def _getAvailableVoices(self):
+		voices=OrderedDict()
+		for v in _espeak_mb.getMbrolaVoiceList():
+			l=_espeak_mb.decodeEspeakString(v.languages[1:])
+			# #7167: Some languages names contain unicode characters EG: Norwegian Bokmål
+			name=_espeak_mb.decodeEspeakString(v.name)
+			# #5783: For backwards compatibility, voice identifies should always be lowercase
+			identifier=os.path.basename(_espeak_mb.decodeEspeakString(v.identifier)).lower()
+			voices[identifier]=VoiceInfo(identifier,name,l)
+		return voices
+
+	def _get_voice(self):
+		curVoice=getattr(self,'_voice',None)
+		if curVoice: return curVoice
+		curVoice = _espeak_mb.getCurrentVoice()
+		if not curVoice:
+			return ""
+		# #5783: For backwards compatibility, voice identifies should always be lowercase
+		return _espeak_mb.decodeEspeakString(curVoice.identifier).split('+')[0].lower()
+
+	def _set_voice(self, identifier):
+		if not identifier:
+			return
+		# #5783: For backwards compatibility, voice identifies should always be lowercase
+		identifier=identifier.lower()
+		# Configurations saved before 3.0 may still name the classic descriptors.
+		identifier={"usd16": "mb-usd16", "usd": "mb-usd"}.get(identifier, identifier)
+		if "\\" in identifier:
+			identifier=os.path.basename(identifier)
+		self._voice=identifier
+		try:
+			_espeak_mb.setVoiceAndVariant(voice=identifier,variant="NONE")
+		except:
+			self._voice=None
+			raise
+		self._language=super(SynthDriver,self).language
+
+	def _onIndexReached(self, index):
+		if index is not None:
+			synthIndexReached.notify(synth=self, index=index)
+		else:
+			synthDoneSpeaking.notify(synth=self)
+
+	def terminate(self):
+		_espeak_mb.terminate()
+
