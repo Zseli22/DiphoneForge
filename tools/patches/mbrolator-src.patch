@@ -1,0 +1,80 @@
+diff --git a/Resynthesis/Src/database_build.c b/Resynthesis/Src/database_build.c
+index a937ec3..adb9af6 100644
+--- a/Resynthesis/Src/database_build.c
++++ b/Resynthesis/Src/database_build.c
+@@ -603,6 +603,9 @@ int main(int argc, char **argv)
+       fclose(tmp);
+     }
+ 
++#ifdef _WIN32
++  fprintf(big_one,"Built on Windows (MinGW)\n");
++#else
+   if ( (tmp=popen("date","r")) != 0)
+     {
+       while (fgets(buffer,BUFFER_SIZE,tmp)!=NULL)
+@@ -612,6 +615,7 @@ int main(int argc, char **argv)
+ 	}
+       pclose(tmp);
+     }
++#endif
+ 
+   /* Database building info, F0 Parameters */
+   sprintf(name,"%s.f0",dba_name);
+@@ -677,8 +681,10 @@ int main(int argc, char **argv)
+   fprintf(big_one,"Copyright (c) 1995-2019 Faculté Polytechnique de Mons - TCTS lab\n");
+   fclose(big_one);
+ 
++#ifndef _WIN32
+   sprintf(sys,"/bin/rm -f SORTIE.*"); /* well well... */
+   system(sys);
++#endif
+ 
+   return 0;
+ }
+diff --git a/Resynthesis/Src/resynth.c b/Resynthesis/Src/resynth.c
+index b1efefa..21e8822 100644
+--- a/Resynthesis/Src/resynth.c
++++ b/Resynthesis/Src/resynth.c
+@@ -671,12 +671,12 @@ double resynth(char *s16_file_name, char *output_s16, char *output_pm, double ga
+       exit(1);
+     }
+ 
+-  if ((output_file=fopen(output_s16,"w"))==NULL)
++  if ((output_file=fopen(output_s16,"wb"))==NULL)
+ 	 {
+ 		fprintf(stderr,"FATAL ERROR with file %s!\n",output_s16);
+ 		exit(1);
+ 	 }
+-  if ((pm_file=fopen(output_pm,"w"))==NULL)
++  if ((pm_file=fopen(output_pm,"wb"))==NULL)
+ 	 {
+ 		fprintf(stderr,"FATAL ERROR with file %s!\n",output_pm);
+ 		exit(1);
+diff --git a/Resynthesis/Src/wincompat.c b/Resynthesis/Src/wincompat.c
+new file mode 100644
+index 0000000..66cc5ae
+--- /dev/null
++++ b/Resynthesis/Src/wincompat.c
+@@ -0,0 +1,10 @@
++/* Minimal POSIX drand48() for MinGW-w64 builds of MBROLATOR. */
++#include <stdint.h>
++
++static uint64_t rand48_state = 0x1234abcd330eULL;
++
++double drand48(void)
++{
++	rand48_state = (rand48_state * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
++	return (double)rand48_state / 281474976710656.0;
++}
+diff --git a/Resynthesis/Src/wincompat.h b/Resynthesis/Src/wincompat.h
+new file mode 100644
+index 0000000..80e6417
+--- /dev/null
++++ b/Resynthesis/Src/wincompat.h
+@@ -0,0 +1,6 @@
++#ifndef WINCOMPAT_H
++#define WINCOMPAT_H
++
++double drand48(void);
++
++#endif

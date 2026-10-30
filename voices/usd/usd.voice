@@ -1,0 +1,18 @@
+# Voice package manifest.
+# Consumed by build.ps1 and by the voice-builder tooling.
+# One "key = value" per line; unknown keys are ignored.
+
+id = usd
+display_name = US English (USD, 22.05 kHz)
+language = en-us
+sample_rate = 22050
+database = usd
+descriptor = mb-usd
+phtrans = usd_phtrans
+base_pitch = 120
+gender = male
+licence = CC-BY-4.0
+licence_url = https://creativecommons.org/licenses/by/4.0/
+provenance = PROVENANCE.md
+builder = tools/build_mbrola_db.py
+units = 2303

@@ -1,0 +1,15 @@
+{
+  "_comment": "Optional mapping from aligner-safe token IDs to friendlier display words for the speaker. "
+            "The aligner still uses the phonetic token; this only changes what the speaker reads. "
+            "The display word should match the target phones in eSpeak notation.",
+  "cv_b_ii": "bee",
+  "cv_k_ii": "key",
+  "cv_m_ei": "may",
+  "cv_s_ei": "say",
+  "cv_w_ai": "why",
+  "vc_ii_t": "eat",
+  "vc_ou_n": "own",
+  "ccv_s_p_ai": "spy",
+  "ccv_s_t_ei": "stay",
+  "ccv_p_r_ei": "pray"
+}

@@ -1,0 +1,210 @@
+[
+  {
+    "test": "coverage_00",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 101.4528125,
+    "rms": 2752.3353471197256,
+    "peak": 24097.0,
+    "longest_silence_s": 0.046,
+    "zeros_pct": 7.6372328268376,
+    "log": ""
+  },
+  {
+    "test": "coverage_01",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 100.9590625,
+    "rms": 2770.431301006696,
+    "peak": 22936.0,
+    "longest_silence_s": 0.046125,
+    "zeros_pct": 7.694517270304487,
+    "log": ""
+  },
+  {
+    "test": "coverage_02",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 97.8573125,
+    "rms": 2539.4273756747625,
+    "peak": 22677.0,
+    "longest_silence_s": 0.04575,
+    "zeros_pct": 7.95584387216847,
+    "log": ""
+  },
+  {
+    "test": "coverage_03",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 96.033625,
+    "rms": 2510.758195821976,
+    "peak": 22722.0,
+    "longest_silence_s": 0.1475625,
+    "zeros_pct": 13.944269520181082,
+    "log": ""
+  },
+  {
+    "test": "coverage_04",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 128.1576875,
+    "rms": 3512.2306750875537,
+    "peak": 23840.0,
+    "longest_silence_s": 0.0461875,
+    "zeros_pct": 5.980327945602171,
+    "log": ""
+  },
+  {
+    "test": "coverage_05",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 123.5553125,
+    "rms": 3658.053121480173,
+    "peak": 24163.0,
+    "longest_silence_s": 0.0461875,
+    "zeros_pct": 6.250490038621366,
+    "log": ""
+  },
+  {
+    "test": "coverage_06",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 72.06,
+    "rms": 1169.3696648419143,
+    "peak": 14027.0,
+    "longest_silence_s": 0.0459375,
+    "zeros_pct": 10.894393560921454,
+    "log": "Too many phones without pitch information at 'tS'\nToo many phones without pitch information at 'b'\nToo many phones without pitch information at 'r'\nToo many phones without pitch information at 'N'"
+  },
+  {
+    "test": "coverage_07",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 51.07925,
+    "rms": 1799.972705005213,
+    "peak": 19201.0,
+    "longest_silence_s": 0.0466875,
+    "zeros_pct": 10.353641645090716,
+    "log": "Too many phones without pitch information at 'j'\nToo many phones without pitch information at 'f'"
+  },
+  {
+    "test": "word_see",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.393375,
+    "rms": 2708.0060031667513,
+    "peak": 15488.0,
+    "longest_silence_s": 0.0468125,
+    "zeros_pct": 21.893867175087383
+  },
+  {
+    "test": "word_tap",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.487375,
+    "rms": 2481.942624891776,
+    "peak": 13985.0,
+    "longest_silence_s": 0.04575,
+    "zeros_pct": 17.863554757630162
+  },
+  {
+    "test": "word_pat",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.4874375,
+    "rms": 2777.147839825366,
+    "peak": 14648.0,
+    "longest_silence_s": 0.0470625,
+    "zeros_pct": 17.89973073470958
+  },
+  {
+    "test": "word_extras",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.9456875,
+    "rms": 2951.8557977847327,
+    "peak": 19000.0,
+    "longest_silence_s": 0.0460625,
+    "zeros_pct": 9.206265283193444
+  },
+  {
+    "test": "word_further",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.7686875,
+    "rms": 3306.802134752414,
+    "peak": 17603.0,
+    "longest_silence_s": 0.046,
+    "zeros_pct": 11.196032197739655
+  },
+  {
+    "test": "word_computer",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 1.22875,
+    "rms": 3102.6545799725463,
+    "peak": 15714.0,
+    "longest_silence_s": 0.046,
+    "zeros_pct": 7.171922685656154
+  },
+  {
+    "test": "word_unnamed",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.856875,
+    "rms": 2710.310247447318,
+    "peak": 10977.0,
+    "longest_silence_s": 0.046125,
+    "zeros_pct": 9.992706053975201
+  },
+  {
+    "test": "word_bookkeeper",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 1.134,
+    "rms": 3255.787781311926,
+    "peak": 16492.0,
+    "longest_silence_s": 0.0458125,
+    "zeros_pct": 7.738095238095238
+  },
+  {
+    "test": "word_output",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.7665625,
+    "rms": 2797.1989510124313,
+    "peak": 17227.0,
+    "longest_silence_s": 0.0470625,
+    "zeros_pct": 11.504280472890338
+  },
+  {
+    "test": "word_texts",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.758125,
+    "rms": 2569.779350108492,
+    "peak": 17448.0,
+    "longest_silence_s": 0.0465625,
+    "zeros_pct": 11.830173124484748
+  },
+  {
+    "test": "word_asked",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.5766875,
+    "rms": 1853.1930378883635,
+    "peak": 8668.0,
+    "longest_silence_s": 0.0470625,
+    "zeros_pct": 15.357104150861604
+  },
+  {
+    "test": "word_strengths",
+    "status": "ok",
+    "rate": 16000,
+    "duration_s": 0.8444375,
+    "rms": 2459.3442078723956,
+    "peak": 13401.0,
+    "longest_silence_s": 0.0456875,
+    "zeros_pct": 10.258308045296426
+  }
+]

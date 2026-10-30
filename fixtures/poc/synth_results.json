@@ -1,0 +1,90 @@
+[
+  {
+    "database": "poc16",
+    "pho": "all",
+    "wav": "output\\mbrola_poc\\wav\\poc16_all.wav",
+    "rate": 16000,
+    "duration_s": 1.4246875,
+    "rms": 3111.3,
+    "peak": 25003,
+    "f0_hz": 121.2,
+    "spectral_flatness": 0.41
+  },
+  {
+    "database": "poc16",
+    "pho": "pat",
+    "wav": "output\\mbrola_poc\\wav\\poc16_pat.wav",
+    "rate": 16000,
+    "duration_s": 0.51,
+    "rms": 3083.1,
+    "peak": 16179,
+    "f0_hz": 122.1,
+    "spectral_flatness": 0.301
+  },
+  {
+    "database": "poc16",
+    "pho": "see",
+    "wav": "output\\mbrola_poc\\wav\\poc16_see.wav",
+    "rate": 16000,
+    "duration_s": 0.48675,
+    "rms": 3330.5,
+    "peak": 24994,
+    "f0_hz": 124.0,
+    "spectral_flatness": 0.375
+  },
+  {
+    "database": "poc16",
+    "pho": "tap",
+    "wav": "output\\mbrola_poc\\wav\\poc16_tap.wav",
+    "rate": 16000,
+    "duration_s": 0.50975,
+    "rms": 2470.1,
+    "peak": 14993,
+    "f0_hz": 122.1,
+    "spectral_flatness": 0.285
+  },
+  {
+    "database": "poc22050",
+    "pho": "all",
+    "wav": "C:\\Users\\vangi\\Downloads\\New Folder\\output\\mbrola_poc\\wav\\poc22050_all.wav",
+    "rate": 22050,
+    "channels": 1,
+    "width": 2,
+    "duration_s": 1.4276190476190476,
+    "rms": 3796.312013486952,
+    "peak": 24829
+  },
+  {
+    "database": "poc22050",
+    "pho": "pat",
+    "wav": "C:\\Users\\vangi\\Downloads\\New Folder\\output\\mbrola_poc\\wav\\poc22050_pat.wav",
+    "rate": 22050,
+    "channels": 1,
+    "width": 2,
+    "duration_s": 0.508390022675737,
+    "rms": 4097.120661152515,
+    "peak": 23866
+  },
+  {
+    "database": "poc22050",
+    "pho": "see",
+    "wav": "C:\\Users\\vangi\\Downloads\\New Folder\\output\\mbrola_poc\\wav\\poc22050_see.wav",
+    "rate": 22050,
+    "channels": 1,
+    "width": 2,
+    "duration_s": 0.48376417233560093,
+    "rms": 3629.519181760294,
+    "peak": 21905
+  },
+  {
+    "database": "poc22050",
+    "pho": "tap",
+    "wav": "C:\\Users\\vangi\\Downloads\\New Folder\\output\\mbrola_poc\\wav\\poc22050_tap.wav",
+    "rate": 22050,
+    "channels": 1,
+    "width": 2,
+    "duration_s": 0.5085260770975056,
+    "rms": 3442.8809007726913,
+    "peak": 23054
+  }
+]

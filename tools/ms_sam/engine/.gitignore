@@ -1,0 +1,16 @@
+# Microsoft voice data: never commit
+src/sam_data.c
+data/
+*.spd
+*.LXA
+*.lxa
+
+# build output and renders
+build/
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.wav
+__pycache__/

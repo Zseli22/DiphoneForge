@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>eSpeak NG with MBROLA</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<h1>eSpeak NG with MBROLA</h1>
+
+<p>This add-on gives NVDA an eSpeak NG synthesizer that drives MBROLA voices. eSpeak NG produces the phonetic timing and pitch, and MBROLA produces the audio from a diphone database. The result keeps eSpeak's responsiveness and navigation behaviour while using a recorded human voice.</p>
+
+<h2>Requirements</h2>
+<ul>
+<li>NVDA 2026.1 or later, 64-bit. The add-on loads a 32-bit helper process, so it will not run on older NVDA releases.</li>
+</ul>
+
+<h2>Voices included</h2>
+<p>One voice is installed by default and two are shipped:</p>
+<ul>
+<li><strong>US English, USD16</strong>, 16 kHz. This is the default voice. It works in every NVDA configuration and is the lightest option.</li>
+<li><strong>US English, USD</strong>, 22.05 kHz. The same recordings at a higher sample rate, included as a proof of concept for higher-fidelity databases. It uses more memory and about 40 percent more disk space.</li>
+</ul>
+<p>Both voices come from this project's own recordings and are published under CC BY 4.0.</p>
+
+<h2>Adding other MBROLA voices</h2>
+<p>The add-on supports any MBROLA database, not only the one it ships with. Only databases that are actually present are listed in NVDA's voice list, so nothing appears broken when a voice is missing.</p>
+<p>To add a voice:</p>
+<ul>
+<li>Download a database from the MBROLA voices collection at <a href="https://github.com/numediart/MBROLA-voices">github.com/numediart/MBROLA-voices</a>.</li>
+<li>Copy the database file into the folder <code>espeak-ng-data\mbrola</code> inside the add-on directory under your NVDA configuration folder.</li>
+<li>eSpeak already ships the matching voice descriptor and phone translation table for the standard MBROLA voices, so no further configuration is needed.</li>
+<li>Restart NVDA. The new voice appears in the voice list with the other MBROLA voices.</li>
+</ul>
+<p>Each MBROLA database has its own licence and its own author. The standard terms allow free copying and distribution, provided the notice travels with the database, and they forbid selling the database or embedding it in a sold product without the author's permission. They also permit use only with MBROLA itself. Read the <code>license.txt</code> file that comes with each voice before you redistribute it.</p>
+
+<h2>Settings</h2>
+<ul>
+<li><strong>Voice</strong>: the MBROLA voice to use.</li>
+<li><strong>Rate</strong>: maps to an eSpeak speaking rate. Rate boost multiplies it by 1.5. Fast rates remain intelligible because the timing model keeps vowel and consonant floors instead of letting durations collapse.</li>
+<li><strong>Pitch</strong>: the base pitch of the voice.</li>
+<li><strong>Inflection</strong>: the pitch range eSpeak applies on top of the base pitch.</li>
+<li><strong>Volume</strong>: applies gain through a soft limiter, so raising it does not clip.</li>
+</ul>
+<p>Capital pitch change is not supported by the MBROLA path. Use NVDA's "beep for capitals" setting instead.</p>
+
+<h2>Troubleshooting</h2>
+<ul>
+<li><strong>No speech after selecting the synthesizer</strong>: make sure the chosen voice's database file is present in <code>espeak-ng-data\mbrola</code>.</li>
+<li><strong>The voice list is empty</strong>: no database was found. Add one as described above.</li>
+<li><strong>Speech starts late on the first utterance</strong>: the helper process is starting. Subsequent utterances begin within a few milliseconds.</li>
+</ul>
+
+<h2>Credits</h2>
+<p>This add-on is a continuation of "Espeak with Mbrola included" by Felipe Porciuncula Zanabria, which ported classic eSpeak with MBROLA support into an NVDA add-on. The synthesizer driver descends from NVDA's own eSpeak driver by NV Access Limited and contributors. eSpeak NG is by Jonathan Duddington and the eSpeak NG contributors. MBROLA is by the TCTS Laboratory of the University of Mons and the numediart institute.</p>
+
+<h2>Licence</h2>
+<p>The add-on code is distributed under the GNU General Public License version 2. The MBROLA engine is distributed under the GNU Affero General Public License version 3. eSpeak NG and its data are distributed under the GNU General Public License version 3. The USD16 and USD voice databases are published under CC BY 4.0. Full texts and per-component details are in the LICENSES folder and in NOTICE.md in the project repository.</p>
+</body>
+</html>

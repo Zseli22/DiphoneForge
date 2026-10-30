@@ -1,0 +1,37 @@
+diff --git a/Parser/input_fifo.c b/Parser/input_fifo.c
+index 45ef7ae..fb35bb3 100644
+--- a/Parser/input_fifo.c
++++ b/Parser/input_fifo.c
+@@ -32,7 +32,7 @@
+    directly call with self for all functions, except Close
+ */
+ 
+-static int readline_InputFifo(Input* in, char *line, int size)
++static long readline_InputFifo(Input* in, char *line, int size)
+ {
+ 	return( readline_Fifo((Fifo*) in->self,line,size) );
+ }
+@@ -42,7 +42,9 @@ static void reset_InputFifo(Input* in)
+ 	reset_Fifo((Fifo*) in->self);
+ }
+ 
+-static void close_InputFifo(Input* in)
++/* Not static: the library-based (DLL) build frees the input through this
++ * function from LibOneChannel/onechannel.c. Local patch for the Windows DLL. */
++void close_InputFifo(Input* in)
+ {
+ 	MBR_free(in);
+ }
+diff --git a/Parser/input_fifo.h b/Parser/input_fifo.h
+index 54eb16e..6c21731 100644
+--- a/Parser/input_fifo.h
++++ b/Parser/input_fifo.h
+@@ -30,6 +30,8 @@
+ #include "fifo.h"
+ 
+ Input* init_InputFifo(Fifo* my_fifo);
++/* Local patch for the Windows DLL build: used by LibOneChannel/onechannel.c. */
++void close_InputFifo(Input* in);
+ 
+ #endif
+ 

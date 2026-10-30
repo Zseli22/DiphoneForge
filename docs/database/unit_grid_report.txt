@@ -1,0 +1,9 @@
+Diphone Unit Grid Report
+========================
+Script lines processed: 1666
+Diphone units expected: 2333
+Units extracted to grid: 2333
+Units/failed entries: 0
+
+Flag counts:
+  mostly_unvoiced: 497
