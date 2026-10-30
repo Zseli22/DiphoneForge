@@ -30,6 +30,8 @@ interruption and queued utterances all behave.
   improve.
 - The add-on now ships only these two voices. Third-party MBROLA databases are
   supported but not distributed; see "Licensing" below.
+- Published at `https://github.com/Zseli22/DiphoneForge`. Release `v3.0` carries
+  `espeakWitMbrola-3.0.nvda-addon` and its SHA256.
 - The voice builder is still a set of project-specific scripts, English only.
   Making it a guided, language-neutral workflow is the active development goal.
 
@@ -549,10 +551,10 @@ old `rerecord` verdicts into a pickup prompt list.
 
 ## Next work
 
-1. **Publish the repository.** Create `Zseli22/DiphoneForge`, confirm the voice
-   licence (CC BY 4.0 by default), and make the first release with the built
-   `espeakWitMbrola-3.0.nvda-addon`. A store submission would need a distinct
-   add-on name; continuity argues for staying on GitHub.
+1. **Release maintenance.** The repository is published as `DiphoneForge` with
+   release `v3.0`. Future changes follow `docs/publishing.md`: bump the version
+   in `addon/manifest.ini`, rebuild, verify with `tools/compare-install.ps1` and
+   the smoke tests, then tag and release.
 2. **Guided voice builder.** Turn the stage scripts into a `project.json`-driven
    pipeline: plan, import, align, grid, audit, build, package. Each stage needs
    to be idempotent, resumable, and free of English and path assumptions. Two
