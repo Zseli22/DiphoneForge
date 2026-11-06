@@ -1,211 +1,412 @@
-# Recording Guide for the Diphone Voice Database
+# Recording Guide
 
-This guide covers the practical steps for recording your own voice for the diphone synthesizer.
+This guide covers recording your own voice for a diphone voice database. It is
+written for the person behind the microphone, not for the person writing the
+pipeline code.
 
-The goal is **not** to produce perfectly edited clips at this stage. You will record one (or a few) long audio files, and the computer will later cut them into diphone units using forced alignment.
-
----
-
-## 1. Recording Format
-
-Use the best quality your recorder supports:
-
-- **File format:** Uncompressed WAV or PCM if possible. Avoid MP3 if you can — lossy compression leaves artifacts that make pitch analysis harder.
-- **Sample rate:** 44,100 Hz (or 48,000 Hz; we can resample to 44.1 kHz later).
-- **Bit depth:** 16-bit or 24-bit.
-- **Channels:** Mono.
-
-After transferring to your computer, keep the raw files untouched in a backup folder. Work only on copies.
+You do not need a phonetics background, a treated room, or expensive equipment.
+You do need a quiet space, a consistent voice, and a recording you can map back
+to the prompt list. Everything else is recoverable.
 
 ---
 
-## 2. Environment & Microphone Technique
+## 1. What you are recording, and why
 
-- Record in the quietest room available. Turn off fans, air conditioning, and electronics that hum.
-- Reduce echo: record in a room with soft furnishings, or hang blankets around the recording area.
-- Keep the microphone a consistent distance from your mouth throughout the session (about 15–25 cm / 6–10 inches).
-- Use a pop filter or windscreen if you have one. Plosives like `/p/` and `/b/` can cause clipping that is hard to fix later.
-- Avoid moving your head while speaking. Consistent microphone angle matters.
+The synthesiser is built from **diphones**: the sound of one phone moving into
+the next. The `p` of "pat" gliding into the `a` is one diphone; the `a` gliding
+into the `t` is another. A full voice needs every transition the language
+actually uses, so the recording is a systematic sweep of them, not a reading of
+prose.
 
----
+Each prompt is therefore a short syllable, usually two or three phones:
 
-## 3. Monitoring with Headphones
-
-Your plan to use headphones so you can hear yourself is good. A few tips:
-
-- Use **closed-back headphones** so sound from the headphones does not leak into the microphone.
-- Keep the headphone volume low. You only need to hear yourself clearly, not loudly.
-- Listen for:
-  - Plosive pops and breath blasts.
-  - Mouth clicks and lip smacks.
-  - Room noise, hum, or outside sounds.
-  - Inconsistent loudness.
-
----
-
-## 4. How to Pitch Your Voice
-
-You do **not** need to be perfectly monotone. Because the engine normalizes pitch afterward, the important things are:
-
-- Pick a comfortable, natural pitch and stay roughly in that range.
-- Avoid large pitch sweeps *within* a single syllable (e.g., do not intonate "baa" as a question).
-- Avoid vocal fry (very low, creaky voice) and falsetto (very high, breathy voice).
-- Try not to let your pitch drift downward as you get tired. Take breaks.
-- A small amount of natural pitch variation is fine and even helpful; the analysis will extract an average F0 and normalize it.
-
-You do not need to match a musical note or use a pitch guide.
-
----
-
-## 5. Timing and Pace
-
-Syllables do **not** need to be the same length.
-
-- Speak at a natural, deliberate pace.
-- Leave about **half a second to one second of silence** between each item.
-- If you plan to say each item twice, leave a short pause between the two repetitions.
-- Do not rush. Quality is more important than speed.
-- Take a longer break every 50–100 lines. Drink water. Stretch.
-- Avoid over-articulating or under-articulating. Read the prompts the way you would naturally say them.
-
----
-
-## 6. The Recording Script
-
-Generate a script with two repeats per item:
-
-```bash
-python tools/generate_recording_script.py --vowel-set full --repeats 2 --output-dir output
+```
+p i:
+t a p
+s t r E
 ```
 
-This produces a file at `output/recording_script.txt` with each line appearing twice, for example:
+Two properties of that list matter:
+
+- **The prompts are nonsense on purpose.** A real word carries its own stress,
+  rhythm and spelling traps, and you would also spend time on sounds the
+  language does not use in that position. A nonsense syllable has exactly one
+  correct reading, which makes both your job and the aligner's job easier.
+- **The symbols are for the computer.** `0` is a vowel, `S` and `s` are
+  different consonants, and `T` is not a `t`. You are not expected to decode
+  them. You are expected to say what the pronunciation reference says, and
+  section 4 explains what that is.
+
+A full US English set is about 1,600 lines. A language with 25 to 30 phones
+needs far fewer, because the number of transitions grows with the square of the
+inventory.
+
+The list is generated from the language's inventory:
+
+```bash
+python tools/generate_recording_script.py --vowel-set full --output-dir output
+```
+
+That writes the speaker script, the aligner transcript, the dictionary and the
+diphone map. Generate them once and keep all four together: the line numbers are
+the identity of every take, and everything later refers back to them.
+
+### Only record sounds that differ
+
+An inventory written for compatibility with several varieties contains symbols
+that are the same sound in yours. General American is a clear case: `A:` and `0`
+are the PALM and LOT vowels, and the eSpeak voice renders them as literally the
+same waveform; `3` and `3:` are both the NURSE vowel and differ only in spectral
+tilt. Recording both halves of such a pair costs recording time and cannot
+improve the voice, because the frontend cannot ask for a distinction the voice
+does not make.
+
+`tools/find_duplicate_vowels.py` finds these automatically. It renders every
+vowel in a fixed consonant frame, compares the renders, and writes a merge map:
+
+```bash
+python tools/find_duplicate_vowels.py --write output/vowel_merges.json
+```
+
+For US English it reports `0 -> A:` and `3: -> 3`, which removes 141 of the 1,620
+prompts. The same file feeds the prompt generator, which drops the redundant
+targets, and the eSpeak table writer, which maps the dropped symbol to the vowel
+you did record:
+
+```bash
+python tools/generate_recording_script.py --vowel-merges output/vowel_merges.json
+```
+
+The tool can only find distinctions the synthesiser does not make. A merge that
+belongs to your dialect, such as cot and caught, is a listening decision; the
+report lists the closest pairs just outside the threshold so you can make it.
+
+---
+
+## 2. Before you record
+
+### Equipment
+
+- A microphone you can keep at a fixed distance. A large-diaphragm condenser or
+  a decent dynamic microphone both work; consistency matters more than cost.
+- An interface or recorder that can write uncompressed audio.
+- Closed-back headphones, or a single earbud, for monitoring.
+- A pop filter or windscreen. Plosives like `p` and `b` are half of the corpus
+  and are the easiest thing to ruin with a breath blast.
+
+### Room
+
+- The quietest room you have. Soft furnishings, curtains, a carpet and a bed
+  help more than any plugin.
+- Turn off fans, air conditioning, fridges, fluorescent ballasts and anything
+  that hums. A fridge two rooms away is still audible at these levels.
+- Avoid a room with parallel bare walls; echo cannot be removed later without
+  damaging the voice.
+- Put the microphone slightly off-axis from your mouth and angle the null of a
+  cardioid pattern at your monitor and any equipment fan.
+
+### Format and levels
+
+- **Format:** uncompressed WAV. 44.1 kHz or 48 kHz, 16-bit or 24-bit, mono.
+  Keep the same format for the whole project.
+- **Levels:** aim for speech peaks around -6 dBFS. Never touch 0 dBFS; a clipped
+  plosive cannot be repaired.
+- **No processing while recording.** No compression, no limiter, no noise
+  reduction, no EQ, no automatic gain. The analysis needs the raw signal, and
+  processing that helps one unit hurts another.
+- **Disable the operating system's "enhancements"**: automatic gain control,
+  noise suppression, beam forming and echo cancellation all alter the signal in
+  ways the pipeline cannot see.
+- **Record a few seconds of room tone** at the start of every session. It is
+  used to build the silence-to-phone units at word edges, so it should be the
+  same room, the same microphone and the same gain as the speech.
+- **Do not trim silence to zero.** Leave a second or two at the start and end of
+  each file. The aligner uses the silence to find the first and last prompt.
+
+---
+
+## 3. Your voice
+
+The database is one voice recorded consistently, over however many sessions it
+takes, so the aim is not your best performance but your most repeatable one.
+
+- **Use your normal speaking voice**, at your normal volume, at your normal
+  distance from the microphone. Do not project like a stage actor and do not
+  whisper.
+- **Stay in one pitch range.** You do not need to be monotone, and small natural
+  variation is fine, but avoid questions, exclamations and sighs. The prompts
+  are neutral statements.
+- **Do not copy the reference voice's pitch or melody.** The reference is a
+  synthesiser, usually near-monotone. Copy its sounds, not its tune, and not its
+  timbre.
+- **Keep the articulation ordinary.** Over-articulating produces clean isolated
+  sounds that sound wrong when joined; slurring produces units that cannot be
+  cut. Say each item as you would say it inside a word.
+- **Keep posture and head position steady.** Leaning in for a quiet line changes
+  the tone and leaves a seam in the database.
+- **Take breaks.** Fifty to a hundred lines, then stand up, drink water, and let
+  your voice settle. Fatigue shows up as pitch drift and lazy consonants, and it
+  shows up in the audit later.
+
+---
+
+## 4. Following the pronunciation reference
+
+The prompt list is a phone string, which is not readable. The fix is audio, not
+a written explanation.
+
+`tools/render_prompt_reference.py` renders every prompt through eSpeak in the
+language's own voice, with the melody flattened:
+
+```bash
+python tools/render_prompt_reference.py --play --voice en-us
+```
+
+The renderer runs at 150 words per minute by default. Slower is not better here:
+below roughly 140 the eSpeak formant synthesis stretches sustained vowels until
+they flutter, which is harder to imitate than normal speech. If 150 still sounds
+unsteady, raise it towards the normal 175 rather than lowering it.
+
+What the reference is:
+
+- It is the exact sound sequence you are being asked to produce, so a symbol you
+  cannot read stops mattering.
+- It is a check on your own reading. If the reference says a short vowel and you
+  were about to say a long one, you will hear it before you record it.
+
+What the reference is not:
+
+- It is **not the voice you are building**. It is stock eSpeak. Do not imitate
+  its timbre, its pitch or its timing.
+- It is **not a model of the finished speech**. The synthesiser supplies its own
+  melody later; your job is to supply clean, stable sounds.
+
+### Three ways to work with it
+
+**Play in place (recommended).** `--play` renders each prompt in memory and plays
+it, then waits for a key:
 
 ```text
-0001. Say B AA
-0001. Say B AA
-0002. Say B AE
-0002. Say B AE
+[1/1620] line 0001: p i:
+enter or space: next   r: repeat   p: previous   q: quit
 ```
 
-The two repeats let you choose the cleaner take later.
+You hear the prompt, say it into your recorder, and move on when you are ready.
+Nothing is written to disk, and nothing plays while you are not looking at a
+line. `--start-line 240` resumes where you stopped.
 
-You can print the script or have a screen reader read it. A teleprompter or large font is helpful so you are not shuffling paper near the microphone.
+**Preview, then record.** Listen to a block of twenty to fifty prompts, then
+record that block with nothing playing. The sounds are still fresh and there is
+no chance of the reference leaking into the microphone. Use this when you record
+with a separate device, or when the machine playing the reference is the same one
+that is recording.
 
----
+**Follow the track.** `--track` writes the whole set to one file with a gap after
+each prompt, for playing on a phone or another device while you record. Speak
+into the gap. `--announce` speaks the line number before each prompt, which is
+useful when following the track by ear and resuming after a break. The track is
+off by default because a 37-minute recording is the least flexible way to work.
 
-## 7. File Saving & Organization
+If you follow along live rather than previewing, play the reference in one earbud
+at low volume, keep the other ear free for your own voice, and use the earbud on
+the side away from the microphone. Record thirty seconds and listen for a thin,
+synthetic double of the reference underneath your voice; if you hear it, switch
+to previewing. Never play the reference through speakers while recording.
 
-- Save the recording as **one long file per session** (or split only if your recorder forces a file-size limit).
-- Use a clear file name, for example:
-  ```text
-  voice_yourname_session1_2026-06-19.wav
-  ```
-- Keep a session log with notes:
-  - Date and time.
-  - Microphone / recorder used.
-  - Room.
-  - Anything unusual (a car passed, a cough, a restarted take).
-- Record a few seconds of silence at the start of each file. This gives a noise sample for later processing.
-
-Do **not** try to save each syllable as a separate file at this stage. That will be done automatically later.
-
----
-
-## 8. Transfer and Initial Cleanup
-
-After transferring the file to your computer:
-
-1. Make a backup copy in a `raw/` folder and do not touch it again.
-2. Trim only the **very beginning and end** of the recording to remove long leading or trailing silence.
-3. If the recording is extremely long, you may split it into chunks of 200–300 lines each, but keep the line numbering consistent.
-
-Do **not** manually cut out individual syllables. That is the job of the forced aligner in Phase 3.
+The player is the same one the builder will use from the prompt screen. If you
+use a screen reader, the line number and the prompt are printed before the audio,
+so a re-read and a replay are one key each.
 
 ---
 
-## 9. Optional: Using a Display-Words Script
+## 5. Pacing and phrasing
 
-If reading "Say B AA" feels too artificial, you can generate a version that uses real words where available:
+- Leave roughly **half a second to a second** between items. Long enough to
+  separate them, short enough that you keep your place.
+- Say the item once, cleanly. If you plan to say each item twice, use the
+  `--repeats 2` option when generating the script so the transcript expects it.
+- Do not insert unscripted repeats. The aligner expects exactly the prompts the
+  transcript contains.
+- Keep the pace steady across a block. Rushing the last ten lines of a block is
+  the most common source of unusable takes.
 
-```bash
-python tools/generate_recording_script.py \
-    --display-words data/display_words.json.example \
-    --output-dir output/words
+---
+
+## 6. Splitting a session into files
+
+There is no required file layout. The pipeline does not care how many files you
+produce or where you stop; it cares that it can tell **which prompt lines are in
+which file**.
+
+Three common approaches, all supported:
+
+1. **One file per session.** Simplest to manage. A mistake late in the session
+   means trimming back to the last good line and continuing in the same file, or
+   starting a new file at that line.
+2. **One file per block.** A checkpoint every fifty, hundred or few hundred
+   lines. A mistake costs at most one block, and a long project can be spread
+   over several days without losing track.
+3. **One file per prompt.** Maximum isolation and the most work. It is only
+   worth it for pickups of a handful of lines.
+
+People who record live and fear mistakes usually prefer blocks. People who
+record in one sitting usually prefer a single file. Both are fine, and you can
+change approach mid-project.
+
+### The range map
+
+Each recording file is declared with the range of prompt lines it contains:
+
+```
+# filename  first_line  last_line
+session1.wav   1   240
+session2.wav   241 512
 ```
 
-The speaker script will then show words like "Say bee" where a good mapping exists, while the aligner still uses the phonetic token `CV_B_IY`.
+The rule that matters: **every prompt line appears exactly once across all
+files, once and only once, with no gaps and no overlaps.** This map is what lets
+the pipeline find line 812 three months later.
 
-You can also create your own `data/display_words.json` with more mappings.
+### A worked example
 
----
+You are recording into `session2.wav`, which should cover lines 241-512. At line
+400 you fluff the take.
 
-## 10. Repeats, Mistakes, and the Transcript
+- **Fix in place.** Stop. Trim the file back to the end of line 399. Resume
+  recording at line 400 in the same file, or save what you have and start
+  `session3.wav` at line 400. Either way the map stays exact: 241-512 in one
+  file, or 241-399 and 400-512 across two.
+- **Keep going.** Note the number 400, finish the block, and re-record line 400
+  later as a pickup. The map still says 241-512, because the file still contains
+  a take of every line in that range.
 
-The forced aligner works by matching the **transcript** to the **audio**. This means the number of times a syllable appears in the audio must match the number of times it appears in the transcript.
+What you must not do:
 
-### If you record each item twice
+- Leave a line out because it was difficult.
+- Say a line twice and hope the aligner sorts it out. It will not; it will align
+  both takes to one transcript entry and produce a unit cut across the gap.
+- Renumber the script to match what you actually did.
+- Hand-edit the transcript or the diphone map to remove a line. Edit the audio
+  and the range map instead; they are the two things the rest of the pipeline
+  reads.
 
-Generate the script with `--repeats 2`:
+A mismatch between audio and map is the most expensive mistake in the whole
+project. It does not usually fail loudly: a wrong split silently poisons an
+entire block of units, and you only find out when the voice sounds broken. This
+is why the builder validates the map before it accepts any recordings.
 
-```bash
-python tools/generate_recording_script.py --vowel-set full --repeats 2 --output-dir output
-```
+### If your recorder splits files for you
 
-Then speak exactly what the script shows:
-
-```text
-0001. Say B AA        (speak)
-0001. Say B AA        (speak again, with a short pause)
-0002. Say B AE        (speak)
-0002. Say B AE        (speak again)
-```
-
-The aligner will find both utterances. Later you can choose the cleaner take.
-
-### If you make a mistake
-
-1. Stop speaking.
-2. Leave a second or two of silence.
-3. Repeat the same line the correct number of times.
-
-After recording, edit the audio to remove the bad take, and also remove the matching line from `aligner_transcript.txt` and `diphone_map.json` so the counts stay in sync.
-
-Do **not** insert unscripted extra repeats. If the audio has more utterances than the transcript, the aligner will become confused.
-
-### One-take workflow
-
-If you prefer simplicity, use the default one-take script:
-
-```bash
-python tools/generate_recording_script.py --vowel-set full --repeats 1 --output-dir output
-```
-
-This makes alignment the easiest because every transcript line appears exactly once in the audio. If you later dislike a particular take, record only those lines again in a short "pickups" file and provide a matching short transcript. You do not need to re-record the entire session.
-
-### Simple rule
-
-Whatever appears in the audio must appear in the transcript. Keep the two matched, and the alignment will work.
+File-size limits on portable recorders are fine. Treat each resulting file as
+its own range and record where you stopped. Just write down the line number at
+the moment of the split, or the importer will have to guess.
 
 ---
 
-## 11. Quick Checklist Before Recording
+## 7. Mistakes and bad takes
 
-- [ ] Recorder set to WAV, 44.1 kHz or 48 kHz, mono.
-- [ ] Quiet room, mic positioned consistently.
-- [ ] Headphones connected for monitoring.
-- [ ] Recording script loaded and accessible.
-- [ ] Water nearby; avoid sticky or crunchy food.
-- [ ] Test recording made and listened to for plosives, noise, and level.
-- [ ] Plan for breaks every 50–100 lines.
+A fluffed take is normal and not a reason to start over. There are two workable
+responses, described in section 6, and both leave a valid map.
+
+- **Coughs, clicks, sirens, a car outside:** stop, wait for silence, and re-say
+  the line. If the noise covers a whole block, finish the session and re-record
+  that block as a pickup.
+- **A word said with the wrong vowel, or a stumble:** re-say the line
+  immediately. Do not try to fix it in software.
+- **A whole block that feels wrong:** keep it, mark it, and re-record it as a
+  pickup. Re-recording is cheap; a voice built from tired takes is not.
+
+Write the line numbers of anything you are unsure about. A list of forty numbers
+is a ten-minute pickup session; discovering the problem during the audit is a
+week of wondering what went wrong.
 
 ---
 
-## 12. What Happens Next
+## 8. Files, names and backups
 
-Once the recording is done:
+- **Name files predictably**, for example `s01.wav`, `s02.wav`, or
+  `voice_name_session_2026-05-01.wav`. No spaces, no special characters.
+- **Keep a session log**: date, microphone, interface gain, room, anything
+  unusual, and the line range of each file. The range map is the machine-readable
+  part; the log is for you.
+- **Back up the originals immediately** and treat them as read-only. Work from
+  copies, and never apply noise reduction, normalisation or editing to the
+  original.
+- **Keep the format identical** across sessions. If you change sample rate,
+  bit depth or microphone halfway through, say so in the log; mixing formats is
+  recoverable but it leaves seams that are hard to hear and easy to blame on the
+  synthesiser.
+- **Do not move or rename files after you have declared the ranges** without
+  updating the map. The map refers to filenames, not to recording order.
 
-1. Transfer and back up the raw file(s).
-2. Use the forced aligner (Phase 3) to find the exact start and end of each syllable.
-3. The engine extracts diphone units, normalizes pitch, and builds the voice database.
+---
 
-You do not need perfect takes for every line. A few bad takes can be discarded or re-recorded later.
+## 9. Accessibility
+
+The recording workflow is entirely keyboard-usable and does not require reading
+a waveform.
+
+- The prompt list is plain text, one numbered line per item, so any screen reader
+  can read it, and a braille display or large font works equally well.
+- The pronunciation reference is audio, so the symbols on screen never need to be
+  interpreted. If you are following the track by ear, use `--announce` to hear
+  the line number before each prompt.
+- If you record with the prompt on screen, put the play control on a single key
+  and keep the prompt list in a window the screen reader can re-read on demand.
+- Teleprompter software, a second screen, or a phone showing the track are all
+  fine; none of them touch the recorded audio.
+
+---
+
+## 10. Pickups and later re-records
+
+Later re-records use their own short prompt list and their own numbering,
+rather than new lines in the main map:
+
+- Take the flagged line numbers from the audit, or the list you kept while
+  recording.
+- Generate a pickup prompt list for just those lines, with a matching transcript
+  and diphone map.
+- Record it in a fresh file and declare that file against the pickup list.
+
+A pickup file that covers scattered lines is normal; the pickup list is what
+makes it expressible. The legacy route is `tools/generate_rerecord_script.py`,
+which turns old unit-review verdicts into a pickup list; the builder will derive
+pickups from the audit directly.
+
+---
+
+## 11. What happens next
+
+Once the files and the ranges exist:
+
+1. **Segmentation** cuts each line into its own clip and records where it came
+   from in the original file.
+2. **Alignment** matches each clip against its transcript and finds the phone
+   boundaries. Lines where the audio and transcript disagree are flagged rather
+   than guessed at.
+3. **Audit** checks each candidate unit for clipping, displaced speech, silence
+   at the wrong end, and a unit that does not fit its neighbours.
+4. **Build** selects one take per unit, derives the word-edge units from room
+   tone, fills the pairs that were never recorded by splicing, and packs the
+   database.
+5. **Listening** is the final judge. Expect a short pickup list after the first
+   build; that is normal, and it is a much better use of a session than
+   re-recording everything.
+
+You do not need perfect takes for every line. You need an honest map, a stable
+voice, and a quiet room.
+
+---
+
+## 12. Before you start: checklist
+
+- [ ] Prompt list generated, and the number of lines noted.
+- [ ] Pronunciation reference rendered and checked on the first ten prompts.
+- [ ] Recorder set to WAV, mono, 44.1 or 48 kHz, 16 or 24-bit.
+- [ ] Interface gain set so speech peaks near -6 dBFS; no processing enabled.
+- [ ] Room tone recorded at the start of the session.
+- [ ] Headphones or single earbud ready for the reference.
+- [ ] Microphone distance fixed, pop filter in place.
+- [ ] Range map open, with the line number you are starting from.
+- [ ] Water nearby, breaks planned, session log started.

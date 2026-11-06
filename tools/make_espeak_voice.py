@@ -121,6 +121,22 @@ def pack_name(name: str) -> bytes:
     return encoded.ljust(MAX_NAME_BYTES, b"\0")
 
 
+def apply_vowel_merges(
+    mapping: dict[str, tuple[str, ...]], merges: dict[str, str]
+) -> dict[str, tuple[str, ...]]:
+    """Point a merged vowel at the recorded representative.
+
+    A vowel dropped from the recording script still has to be answered when
+    eSpeak emits it, so it needs a record of its own. Outputs that mention it
+    are rewritten too, so nothing points at a phone the database does not have.
+    """
+    for source, target in merges.items():
+        mapping[source] = (target,)
+    for source, outputs in list(mapping.items()):
+        mapping[source] = tuple(merges.get(output, output) for output in outputs)
+    return mapping
+
+
 def build_records(mapping: dict[str, tuple[str, ...]]) -> list[Record]:
     records: list[Record] = []
     for source in sorted(mapping):
@@ -198,10 +214,21 @@ def main() -> int:
                              "eSpeak 1.48 ignores new files in espeak-data/voices/mb, "
                              "so install the descriptor in the voices root.")
     parser.add_argument("--out", default=str(PROJECT_ROOT / "output" / "mbrola_db" / "espeak_voice"))
+    parser.add_argument("--vowel-merges", type=Path, default=None,
+                        help="merge map from find_duplicate_vowels.py. Vowels the "
+                             "speaker did not record are mapped to the recorded "
+                             "representative, so eSpeak can still ask for them.")
     args = parser.parse_args()
 
     low, high = (int(value) for value in args.pitch.split(","))
     mapping = load_mapping()
+    if args.vowel_merges:
+        merges = json.loads(args.vowel_merges.read_text(encoding="utf-8"))
+        merges = merges.get("merges", merges)
+        mapping = apply_vowel_merges(mapping, merges)
+        print("vowel merges: " + ", ".join(
+            f"{source} -> {target}" for source, target in sorted(merges.items())
+        ))
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 

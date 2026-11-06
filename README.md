@@ -30,7 +30,6 @@ understand MBROLA's internals or ask anyone for help.
 | Voice builder as a pipeline of stages | Working scripts, project-specific, English only |
 | Voice builder as a guided application | Not started; design in `docs/voice_builder_plan.md` |
 | Additional languages | Not started |
-| MBROLA NG frontend | Separate add-on, experimental |
 
 ## What the add-on gives you
 
@@ -156,6 +155,7 @@ The current pipeline, in the order it runs:
 | Stage | Script | Output |
 | --- | --- | --- |
 | Plan the corpus | `tools/generate_recording_script.py` | prompts, transcripts, diphone map |
+| Pronunciation reference | `tools/render_prompt_reference.py` | one WAV per prompt, a continuous track, an index |
 | Record | (any recorder) | WAV files plus a line-range file |
 | Segment and align | `tools/make_mfa_corpus.py`, `tools/build_mfa_dictionary.py`, `tools/resegment_from_whole_alignment.py` | per-line clips, TextGrids |
 | Build the unit grid | `tools/build_unit_grid.py` | diphone labels and boundaries |

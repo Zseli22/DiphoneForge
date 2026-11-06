@@ -1,5 +1,6 @@
 {
   "_comment": "US English phoneme inventory matching eSpeak-NG General American output symbols. Token names are aligner-safe equivalents.",
+  "_merge_note": "A variety may merge some of these vowels. US English renders 0 as A: and 3: as 3, so a US project can drop them; tools/find_duplicate_vowels.py detects this per language and voice. The full list stays because other varieties distinguish them.",
   "vowels": [
     "i:", "I", "E", "a", "A:", "0", "O", "V", "U", "u:",
     "@", "3", "3:",

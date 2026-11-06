@@ -5,8 +5,10 @@ Generate a recording script and supporting files for a diphone voice database.
 The script creates nonsense-word prompts that cover the core diphone units needed
 for US English: CV, VC, and up to two-consonant CCV onsets (and optional VCC codas).
 By default, phonotactically impossible or redundant units are omitted so the first
-recording session is shorter. Each prompt is wrapped in a carrier phrase to encourage
-consistent rate and loudness.
+recording session is shorter. The prompt is the target alone: the transcript says
+exactly what the speaker is asked to say, so nothing has to be subtracted during
+alignment. A spoken carrier phrase is still available with --carrier, but it must
+then be recorded and added to the dictionary.
 
 The phone inventory follows eSpeak-NG General American symbols. Aligner tokens
 are safe ASCII equivalents defined in data/phonemes.json.
@@ -55,9 +57,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--carrier",
-        default='Say {target}',
+        default='{target}',
         help="Carrier phrase. Use {target} where the diphone prompt should appear. "
-             "If you change this, update the dictionary entries in the script accordingly.",
+             "The default is no carrier, so the transcript matches the recording "
+             "exactly. A spoken carrier must be recorded every time and added to "
+             "the dictionary entries at the bottom of this file.",
     )
     parser.add_argument(
         "--display-words",
@@ -110,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         help="Disable phonotactic cleanup and generate the full Cartesian inventory. "
              "By default, impossible/redundant units (e.g., /N/ onsets, /h w j/ codas, "
              "V+V diphones, and V+/r/ units covered by r-colored vowels) are omitted.",
+    )
+    parser.add_argument(
+        "--vowel-merges",
+        type=Path,
+        default=None,
+        help="Merge map from find_duplicate_vowels.py. Vowels that the eSpeak "
+             "voice renders identically are dropped from the prompt list, so the "
+             "speaker does not record the same sound twice. The eSpeak table "
+             "writer takes the same file and maps the dropped vowel to the kept one.",
     )
     return parser.parse_args()
 
@@ -245,6 +258,20 @@ def main() -> None:
     cluster_list = clusters["clusters"]
     token_names = phonemes["token_names"]
 
+    vowel_merges: dict[str, str] = {}
+    if args.vowel_merges:
+        payload = load_json(args.vowel_merges)
+        vowel_merges = payload.get("merges", payload)
+        unknown = sorted(set(vowel_merges) - set(vowels))
+        if unknown:
+            raise SystemExit(
+                f"{args.vowel_merges}: merges vowels that are not in this inventory: "
+                + ", ".join(unknown)
+            )
+        # A merged vowel is the same sound as its representative, so dropping it
+        # removes every target that would have duplicated a recorded one.
+        vowels = [vowel for vowel in vowels if vowel not in vowel_merges]
+
     targets = build_targets(
         vowels,
         consonants,
@@ -271,9 +298,11 @@ def main() -> None:
     diphone_map = []
     dictionary = {}
 
-    # Carrier words for the aligner dictionary, in eSpeak notation.
-    # If you change --carrier, add the new carrier words here.
-    dictionary["say"] = ["s", "eI"]
+    # Carrier words for the aligner dictionary, in eSpeak notation. The default
+    # carrier is the target alone, so nothing extra is needed. If you add a
+    # spoken carrier, add its words here.
+    if "say" in args.carrier.lower():
+        dictionary["say"] = ["s", "eI"]
 
     line_no = 1
     for target in targets:
@@ -332,6 +361,7 @@ def main() -> None:
                 "shuffled": args.shuffle,
                 "seed": args.seed if args.shuffle else None,
                 "carrier": args.carrier,
+                "vowel_merges": vowel_merges or None,
             },
             "lines": diphone_map,
         }, indent=2),
@@ -342,6 +372,7 @@ def main() -> None:
     metadata = {
         "vowel_set": args.vowel_set,
         "vowels": vowels,
+        "vowel_merges": vowel_merges or None,
         "num_consonants": len(consonants),
         "num_clusters": len(cluster_list),
         "num_unique_targets": len(targets),

@@ -404,35 +404,6 @@ voice whenever the user had an older folder.
 - A full voice also needs an eSpeak voice descriptor and a matching
   eSpeak-to-MBROLA phone translation table.
 
-## MBROLA NG frontend
-
-`mbrolaNG` is a separate NVDA add-on with its own letter-to-sound, duration and
-pitch engine (`MBROLA_NG.dll` + `mbrola_ng_synth.exe`), language packs
-(`languages/en.dat`, `hr.dat`) and voice catalog. It does not use eSpeak.
-
-Its voice list is not hard-locked. A voice is a folder at
-`%APPDATA%\nvda\mbrola_ng\voices\<id>\` containing the database named `<id>` and
-an `<id>.voice` file with `language`, `base_pitch` and `phoneme_map`.
-`tools/install_mbrola_ng_voice.py` writes both and updates `installed.json`.
-
-- Installed custom voices: `usd16` (16 kHz) and `usd` (22.05 kHz), base pitch
-  120.
-- The English frontend uses ARPAbet-like names; the map is
-  `A=A: AI=aI E=E EI=eI O=O i=i: u=u: r==3: k_h=k p_h=p t_h=t @U=oU {=a`.
-  Unlisted names pass through unchanged. Without the map, most vowels and
-  diphthongs are missing (1.5 s of speech instead of 4.1 s on the test
-  sentence).
-- The engine reads the database header, so the 22.05 kHz voice renders at
-  22050 Hz with the same pitch as the 16 kHz one.
-- Its prosody is its own; samples are in
-  `output/mbrola_db/tests/mbrola_ng_*.wav`.
-- It only ships English and Croatian language data, so new languages go through
-  eSpeak unless MBROLA NG language packs can be produced.
-
-The `.voice` files in `voices/` are a superset of what MBROLA NG needs: they add
-`sample_rate`, `descriptor`, `phtrans`, `licence` and `provenance` so one package
-can serve both engines and carry its own notices.
-
 ## Built offline toolchain
 
 - `tools/mbrolator-src/AnaMBE/Obj/anaf0.exe`
@@ -508,9 +479,16 @@ synthesis itself, or `-i`, to validate a database.
   `take_selection.csv`, `unit_stats.csv`, `fallback_pairs.csv`,
   `build_summary.json` and `validation.json`.
 - `tools/make_espeak_voice.py` writes `usd_phtrans` and the voice descriptors.
-- `tools/install_mbrola_ng_voice.py` installs a database as a MBROLA NG voice.
 - `tools/generate_rerecord_script.py` turns old review verdicts into pickup
   prompts.
+- `tools/render_prompt_reference.py` renders the pronunciation reference for
+  every prompt through eSpeak with the pitch range flattened. `--play` renders
+  and plays each one in memory for the speaker; file mode writes per-prompt WAVs
+  and an index, and `--track` adds the optional continuous track.
+- `tools/find_duplicate_vowels.py` renders each vowel in a fixed frame and
+  compares the renders, so vowels the voice cannot distinguish are merged before
+  the speaker records them. It writes `output/vowel_merges.json`, which both
+  `generate_recording_script.py` and `make_espeak_voice.py` accept.
 - `docs/project_layout.md` classifies source, derived and cache files;
   `docs/voice_builder_plan.md` sketches the guided builder and language packs.
 - `tools/mbrolator-src/` and `tools/mbrola-src/` are locally cloned and built
@@ -565,12 +543,13 @@ old `rerecord` verdicts into a pickup prompt list.
    prompt maps to exactly one source range, once, with no gaps. The
    `DM550891`/`DM550893` split cost a whole block and proved this is the most
    likely import mistake.
-4. **Recording and review UX.** Prompt playback, per-file import, resume across
+4. **Recording and review UX.** Prompt playback wired into the wizard (the CLI
+   renderer already produces the reference track), per-file import, resume across
    sessions, automatic SNR and clipping flags, and a listening queue that turns
    flagged units into a pickup prompt list.
-5. **Second language.** One complete language pack end to end, probably
-   Croatian (MBROLA NG already has `hr.dat`) or Spanish (harder, tests clusters
-   and carriers).
+5. **Second language.** One complete language pack end to end, probably Spanish
+   (a smaller inventory that still tests clusters and carriers) or Croatian
+   (eSpeak NG has `hr`).
 6. **Replace the audible cross-spliced fills.** `gap_recording_prompts.txt` is a
    244-word pickup batch covering the 293 gap pairs the top-10k vocabulary uses;
    `gap_prompts_map.csv` says which pairs each word provides.

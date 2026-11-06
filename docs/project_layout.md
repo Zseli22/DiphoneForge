@@ -83,15 +83,3 @@ Remove-Item output\mbrola_db\usd\raw, output\mbrola_db\usd\ana, output\mbrola_db
 Remove-Item output\mbrola_db\usd\SORTIE.* -Force
 ```
 
-## MBROLA NG voices
-
-`mbrolaNG` stores voices outside its add-on folder, so they survive add-on
-updates:
-
-```
-%APPDATA%\nvda\mbrola_ng\voices\<id>\<id>
-%APPDATA%\nvda\mbrola_ng\voices\<id>\<id>.voice
-```
-
-`tools/install_mbrola_ng_voice.py` writes both and updates `installed.json`.
-The custom voices are installed as `usd16` and `usd`.
