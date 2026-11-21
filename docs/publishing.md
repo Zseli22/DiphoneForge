@@ -67,7 +67,7 @@ Update the status table in `README.md` if the change alters what is shipped.
 ```powershell
 git tag -a v3.0 -m "DiphoneForge 3.0: eSpeak NG with MBROLA, USD16 and USD"
 git push origin main --follow-tags
-& "C:\Users\vangi\Tools\gh\bin\gh.exe" release create v3.0 `
+gh release create v3.0 `
   dist\espeakWitMbrola-3.0.nvda-addon `
   --repo Zseli22/DiphoneForge `
   --title "eSpeak NG with MBROLA 3.0" `

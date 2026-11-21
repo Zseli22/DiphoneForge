@@ -57,7 +57,7 @@ having roughly 2,000 English diphones. This is the relevant efficiency target.
 
 The installed add-on is:
 
-`C:\Users\vangi\AppData\Roaming\nvda\addons\espeakWitMbrola`
+`%APPDATA%\nvda\addons\espeakWitMbrola`
 
 It is version 2.0 and contains:
 
@@ -252,4 +252,4 @@ quality or performance is unacceptable.
 - MBROLA database structure: `https://github.com/numediart/MBROLA/blob/master/Database/database.h`
 - MBROLA ROM/database notes: `https://github.com/numediart/MBROLA/blob/master/Documentation/rom_documentation.txt`
 - eSpeak-NG MBROLA integration: `https://github.com/espeak-ng/espeak-ng/blob/master/docs/mbrola.md`
-- Local NVDA bridge: `C:\Users\vangi\AppData\Roaming\nvda\addons\espeakWitMbrola`
+- Local NVDA bridge: `%APPDATA%\nvda\addons\espeakWitMbrola`
