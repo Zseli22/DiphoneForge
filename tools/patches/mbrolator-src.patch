@@ -1,3 +1,41 @@
+diff --git a/AnaMBE/anambe.cpp b/AnaMBE/anambe.cpp
+index 9446d1e..5064a56 100644
+--- a/AnaMBE/anambe.cpp
++++ b/AnaMBE/anambe.cpp
+@@ -1,4 +1,5 @@
+ // Copyright (c) 1995-2019 Faculté polytechnique de Mons (TCTS lab)
++// Modified 2026-11-23 by DiphoneForge: raise MaxRaie (80 -> 140) for low-F0 22.05 kHz voices.
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as published by
+ // the Free Software Foundation, either version 3 of the License, or
+@@ -85,7 +86,7 @@ int main(int argc, char **argv)
+   a_SoundFile= new SoundRAW(s16_file_name, s16_file_name, Freq);
+ 
+   int nb_tranche= ((FrameLength-FrameShift)/2 +LastSample-FirstSample)/ FrameShift;
+-  int MaxRaie=80;
++  int MaxRaie=140;
+   int Comp=1;
+ 
+   a_PitchCurve= new PitchObject(nb_tranche, FrameLength, FrameShift,FirstSample,LastSample);
+diff --git a/AnaMBE/pitchana.cpp b/AnaMBE/pitchana.cpp
+index de3d30a..84ed69a 100644
+--- a/AnaMBE/pitchana.cpp
++++ b/AnaMBE/pitchana.cpp
+@@ -1,4 +1,5 @@
+ // Copyright (c) 1995-2019 Faculté polytechnique de Mons (TCTS lab)
++// Modified 2026-11-23 by DiphoneForge: raise MaxPer_8000 (100 -> 150) for low-F0 22.05 kHz voices.
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as published by
+ // the Free Software Foundation, either version 3 of the License, or
+@@ -49,7 +50,7 @@
+ #endif
+ 
+ #define MinPer_8000 28  // These definitions are used in the
+-#define MaxPer_8000 100 // class FramePitch_A 
++#define MaxPer_8000 150 // class FramePitch_A (300 samples at Freq=16000 -> down to 73.5 Hz at 22.05 kHz)
+ 
+ // ============================================================================
+ // Class FrameMBEPitch_A
 diff --git a/Resynthesis/Src/database_build.c b/Resynthesis/Src/database_build.c
 index a937ec3..adb9af6 100644
 --- a/Resynthesis/Src/database_build.c
@@ -32,10 +70,59 @@ index a937ec3..adb9af6 100644
    return 0;
  }
 diff --git a/Resynthesis/Src/resynth.c b/Resynthesis/Src/resynth.c
-index b1efefa..21e8822 100644
+index b1efefa..4844689 100644
 --- a/Resynthesis/Src/resynth.c
 +++ b/Resynthesis/Src/resynth.c
-@@ -671,12 +671,12 @@ double resynth(char *s16_file_name, char *output_s16, char *output_pm, double ga
+@@ -1,3 +1,5 @@
++/* Modified 2026-10/2026-11 by DiphoneForge: binary-mode outputs ("wb"),
++ * MAX_HARMO 80 -> 140 (extended PhaseResynth), and 8192-byte MBE line buffer. */
+ char ProgramInfo[]=
+ "* This program does diphone database resynthesis               \n"
+ "*                                                              \n"
+@@ -22,7 +24,7 @@ char ProgramInfo[]=
+ 
+ 
+ #define BUFFER_SIZE 400 /* resynthesis buffer for a frame  */
+-#define MAX_HARMO 80
++#define MAX_HARMO 140
+ #define MAX_FRAMES 200
+ 
+ #define UNVOICED_BANDS 53		  /* Number of sigma noise */
+@@ -161,7 +163,23 @@ double PhaseResynth[]={
+  4.52812720230313E-0001,
+  2.54043372127026E-0001,
+  9.36920039328555E-0001,
+- 1.37312257900621E-0001
++ 1.37312257900621E-0001,
++ /* Extended pseudo-random phases for harmonics 81..140 (low-F0 22.05 kHz voices) */
++ 3.91421783012410E+0000, 1.18234901234567E+0000, 5.41289034123456E+0000, 2.34129876543210E+0000,
++ 0.72193847561029E+0000, 4.61928374651928E+0000, 1.89234761239845E+0000, 5.91827364519283E+0000,
++ 2.91827364512345E+0000, 0.41293847561928E+0000, 3.41293847561928E+0000, 1.52938475619283E+0000,
++ 4.91827364519283E+0000, 2.18273645192837E+0000, 5.18273645192837E+0000, 0.91827364519283E+0000,
++ 3.18273645192837E+0000, 1.31827364519283E+0000, 4.31827364519283E+0000, 2.61827364519283E+0000,
++ 5.61827364519283E+0000, 0.21827364519283E+0000, 3.71827364519283E+0000, 1.71827364519283E+0000,
++ 4.11827364519283E+0000, 2.41827364519283E+0000, 5.31827364519283E+0000, 0.61827364519283E+0000,
++ 3.01827364519283E+0000, 1.01827364519283E+0000, 4.71827364519283E+0000, 2.01827364519283E+0000,
++ 5.81827364519283E+0000, 0.81827364519283E+0000, 3.51827364519283E+0000, 1.41827364519283E+0000,
++ 4.51827364519283E+0000, 2.81827364519283E+0000, 5.01827364519283E+0000, 0.51827364519283E+0000,
++ 3.31827364519283E+0000, 1.61827364519283E+0000, 4.01827364519283E+0000, 2.21827364519283E+0000,
++ 5.51827364519283E+0000, 0.31827364519283E+0000, 3.81827364519283E+0000, 1.91827364519283E+0000,
++ 4.21827364519283E+0000, 2.51827364519283E+0000, 5.21827364519283E+0000, 0.11827364519283E+0000,
++ 3.61827364519283E+0000, 1.11827364519283E+0000, 4.81827364519283E+0000, 2.71827364519283E+0000,
++ 5.71827364519283E+0000, 0.99827364519283E+0000, 3.25827364519283E+0000, 1.82827364519283E+0000
+  };
+ 
+ #ifdef DEBUG
+@@ -178,7 +196,7 @@ float weight[512];    /* Hamming weighting window */
+ void read_mbe(char *file_name,MBE_analysis *mbe)
+ {
+   FILE *mbe_file;
+-  char line[1024];
++  char line[8192];
+   int i,pos,new_pos;
+   int tot_frame;
+   double value;
+@@ -671,12 +689,12 @@ double resynth(char *s16_file_name, char *output_s16, char *output_pm, double ga
        exit(1);
      }
  

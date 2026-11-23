@@ -123,7 +123,7 @@ Built from `tools/mbrolator-src/` and `tools/mbrola-src/` (see `tools/VENDORED.m
 
 - Overview & user install: `README.md`
 - Licensing & third-party sources: `NOTICE.md`, `tools/VENDORED.md`
-- Builder design & recording guide: `docs/voice_builder_plan.md`, `docs/recording_guide.md`
+- Builder design & recording guide: `docs/voice_builder_plan.md`, `docs/word_corpus_pipeline.md`, `docs/recording_guide.md`
 - Release process & repo layers: `docs/publishing.md`, `docs/project_layout.md`
 - Shipped voice audit & build report: `docs/database/BUILD_REPORT.md`
 - Archived build/debug history (local only): `history.md`

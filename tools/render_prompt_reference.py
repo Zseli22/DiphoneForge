@@ -87,13 +87,13 @@ def parse_args() -> argparse.Namespace:
         "--pitch", type=int, default=70, help="Base pitch 0-99 (default: 70)."
     )
     parser.add_argument(
-        "--range", type=int, default=0,
-        help="Pitch range 0-99. 0 flattens the melody so the phones carry the "
-             "information (default: 0).",
+        "--range", type=int, default=30,
+        help="Pitch range 0-99. Mild inflection (default: 30) keeps lexical stress "
+             "natural and clear; use 0 for completely flat pitch.",
     )
     parser.add_argument(
-        "--gap-ms", type=int, default=800,
-        help="Silence between prompts in the track (default: 800).",
+        "--gap-ms", type=int, default=1200,
+        help="Silence between prompts in the track (default: 1200).",
     )
     parser.add_argument(
         "--announce",
@@ -123,6 +123,16 @@ def parse_args() -> argparse.Namespace:
         "--lines",
         default=None,
         help="Render only this line range, for example 1-40.",
+    )
+    parser.add_argument(
+        "--only-supplements",
+        action="store_true",
+        help="Render or play only the non-word minimal-pair supplement lines.",
+    )
+    parser.add_argument(
+        "--only-words",
+        action="store_true",
+        help="Render or play only the real-word lines.",
     )
     parser.add_argument(
         "--workers",
@@ -254,6 +264,18 @@ def read_key() -> str:
     return char
 
 
+def build_target_for_item(item: dict, vowels: set[str]) -> tuple[str, bool]:
+    """Return (espeak_input, is_phoneme_input) for either a word or supplement prompt.
+
+    Real-word prompts are rendered directly as text so eSpeak applies the word's
+    natural lexical stress. Nonsense/supplement prompts use [[...]] phoneme input
+    with an explicit stress mark on the first vowel so eSpeak does not reduce it.
+    """
+    if item.get("kind") == "word" and item.get("text"):
+        return str(item["text"]), False
+    return build_target(item["phones"], vowels), True
+
+
 def play_loop(items: list[dict], args: argparse.Namespace, vowels: set[str]) -> None:
     try:
         import winsound
@@ -264,10 +286,12 @@ def play_loop(items: list[dict], args: argparse.Namespace, vowels: set[str]) -> 
     index = 0
     while 0 <= index < len(items):
         item = items[index]
-        target = build_target(item["phones"], vowels)
-        print(f"\n[{index + 1}/{len(items)}] line {item['line']:04d}: "
-              f"{' '.join(item['phones'])}", flush=True)
-        check_echo(target, item["phones"], args)
+        target, is_phoneme = build_target_for_item(item, vowels)
+        label = item.get("text") if item.get("kind") == "word" else " ".join(item["phones"])
+        detail = f"  ({' '.join(item['phones'])})" if item.get("kind") == "word" else ""
+        print(f"\n[{index + 1}/{len(items)}] line {item['line']:04d}: {label}{detail}", flush=True)
+        if is_phoneme:
+            check_echo(target, item["phones"], args)
         winsound.PlaySound(render_wav(target, args), winsound.SND_MEMORY)
         key = read_key().lower()
         if key in ("\r", " ", ""):
@@ -283,16 +307,19 @@ def play_loop(items: list[dict], args: argparse.Namespace, vowels: set[str]) -> 
 def render_file_entry(
     item: dict, args: argparse.Namespace, vowels: set[str], ref_dir: Path
 ) -> dict:
-    target = build_target(item["phones"], vowels)
+    target, is_phoneme = build_target_for_item(item, vowels)
     data = render_wav(target, args)
     wav_path = ref_dir / f"{item['line']:04d}.wav"
     wav_path.write_bytes(data)
     return {
         "line": item["line"],
+        "kind": item.get("kind"),
         "unit_type": item.get("unit_type"),
+        "text": item.get("text"),
         "phones": item["phones"],
         "file": wav_path.name,
         "target": target,
+        "is_phoneme": is_phoneme,
         "params": wav_params(data),
         "frames": wav_frames(data),
     }
@@ -308,7 +335,8 @@ def write_files(items: list[dict], args: argparse.Namespace, vowels: set[str]) -
         )
 
     for entry in entries:
-        check_echo(entry["target"], entry["phones"], args)
+        if entry["is_phoneme"]:
+            check_echo(entry["target"], entry["phones"], args)
 
     nchannels, sampwidth, framerate = entries[0]["params"]
     for entry in entries:
@@ -317,6 +345,7 @@ def write_files(items: list[dict], args: argparse.Namespace, vowels: set[str]) -
 
     track_path = args.out / "ref" / "track.wav"
     gap = b"\x00" * int(framerate * args.gap_ms / 1000) * nchannels * sampwidth
+    announce_gap = b"\x00" * int(framerate * 0.35) * nchannels * sampwidth
     items_out: list[dict] = []
     position_frames = 0
 
@@ -330,8 +359,10 @@ def write_files(items: list[dict], args: argparse.Namespace, vowels: set[str]) -
         for entry in entries:
             if track is not None and args.announce:
                 number = render_text(str(entry["line"]), args)
-                track.writeframes(wav_frames(number))
-                position_frames += len(wav_frames(number)) // (nchannels * sampwidth)
+                num_frames = wav_frames(number)
+                track.writeframes(num_frames)
+                track.writeframes(announce_gap)
+                position_frames += (len(num_frames) + len(announce_gap)) // (nchannels * sampwidth)
 
             if track is not None:
                 track.writeframes(entry["frames"])
@@ -389,8 +420,16 @@ def main() -> None:
         raise SystemExit(f"prompt list not found: {args.diphone_map}")
 
     data = json.loads(args.diphone_map.read_text(encoding="utf-8"))
-    items = parse_lines(args.lines, args.start_line, data["lines"])
-    vowels = load_vowels(args.phonemes)
+    raw_lines = data["lines"] if isinstance(data, dict) else data
+    if args.only_supplements:
+        raw_lines = [item for item in raw_lines if item.get("kind") != "word"]
+    elif args.only_words:
+        raw_lines = [item for item in raw_lines if item.get("kind") == "word"]
+    items = parse_lines(args.lines, args.start_line, raw_lines)
+    vowels = set(data.get("vowels", [])) if isinstance(data, dict) and data.get("vowels") else load_vowels(args.phonemes)
+    if isinstance(data, dict) and data.get("voice") and args.voice == "en-us":
+        # Respect the diphone_map's recorded voice when the user left --voice at default
+        args.voice = data["voice"]
 
     if args.play:
         play_loop(items, args, vowels)

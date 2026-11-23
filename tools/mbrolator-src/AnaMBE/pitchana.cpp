@@ -1,4 +1,5 @@
 // Copyright (c) 1995-2019 Faculté polytechnique de Mons (TCTS lab)
+// Modified 2026-11-23 by DiphoneForge: raise MaxPer_8000 (100 -> 150) for low-F0 22.05 kHz voices.
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -49,7 +50,7 @@
 #endif
 
 #define MinPer_8000 28  // These definitions are used in the
-#define MaxPer_8000 100 // class FramePitch_A 
+#define MaxPer_8000 150 // class FramePitch_A (300 samples at Freq=16000 -> down to 73.5 Hz at 22.05 kHz)
 
 // ============================================================================
 // Class FrameMBEPitch_A

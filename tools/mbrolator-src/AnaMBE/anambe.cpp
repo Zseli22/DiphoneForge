@@ -1,4 +1,5 @@
 // Copyright (c) 1995-2019 Faculté polytechnique de Mons (TCTS lab)
+// Modified 2026-11-23 by DiphoneForge: raise MaxRaie (80 -> 140) for low-F0 22.05 kHz voices.
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -85,7 +86,7 @@ int main(int argc, char **argv)
   a_SoundFile= new SoundRAW(s16_file_name, s16_file_name, Freq);
 
   int nb_tranche= ((FrameLength-FrameShift)/2 +LastSample-FirstSample)/ FrameShift;
-  int MaxRaie=80;
+  int MaxRaie=140;
   int Comp=1;
 
   a_PitchCurve= new PitchObject(nb_tranche, FrameLength, FrameShift,FirstSample,LastSample);

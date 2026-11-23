@@ -9,7 +9,7 @@ we ship.
 | Directory | Upstream | Commit | Local changes |
 | --- | --- | --- | --- |
 | `mbrola-src` | https://github.com/numediart/MBROLA.git | `274dead162f2` | `Parser/input_fifo.c`, `Parser/input_fifo.h`: `close_InputFifo` exported so the DLL build links. |
-| `mbrolator-src` | https://github.com/numediart/MBROLATOR.git | `3444f6ae1089` | `Resynthesis/Src/resynth.c`: binary-mode output. `Resynthesis/Src/database_build.c`: Windows-safe `date` and `rm`. New files `wincompat.c` / `wincompat.h`: `drand48` and the C23 prototype. |
+| `mbrolator-src` | https://github.com/numediart/MBROLATOR.git | `3444f6ae1089` | `AnaMBE/pitchana.cpp`: `MaxPer_8000` 100→150 (supports relaxed/low male F0 down to ~73 Hz at 22.05 kHz). `AnaMBE/anambe.cpp`: `MaxRaie` 80→140. `Resynthesis/Src/resynth.c`: binary-mode output, `MAX_HARMO` 80→140 (extended `PhaseResynth`), `line[8192]` MBE read buffer. `Resynthesis/Src/database_build.c`: Windows-safe `date` and `rm`. New files `wincompat.c` / `wincompat.h`: `drand48` and the C23 prototype. |
 
 Both patches are in `tools/patches/` as diffs against those commits, so they can
 be reapplied to a fresh clone:
