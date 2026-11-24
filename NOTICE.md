@@ -16,12 +16,19 @@ under which terms, and where the corresponding source can be obtained.
 | Native helper (`espeakMbrolaHost.exe`) | this project | GPL-2.0 | `addon/synthDrivers/espeak_mbrola_host.cpp` | - |
 | USD16 and USD voice databases | 2026-10 | CC BY 4.0 | `voices/` in this repository | - |
 
-## Present in the repository, not in the add-on
+## Present in the repository and/or Voice Builder distribution, not in the add-on
 
 | Component | Licence | Notes |
 | --- | --- | --- |
-| MBROLATOR toolchain (`tools/mbrolator-src`) | AGPL notices in the source files; no top-level licence metadata upstream | Used offline to analyse and pack databases. Not distributed in the add-on. |
-| Corpora and derived data (`output/`, `Voice_audio/`) | CC BY 4.0 for this project's own recordings and derivatives | **Not distributed.** These directories are excluded from the repository; see README. |
+| MBROLATOR toolchain (`tools/mbrolator-src`) | AGPL notices in the source files; no top-level licence metadata upstream | Used offline to analyse and pack databases. Bundled in the standalone Voice Builder release; not distributed in the NVDA add-on. |
+| eSpeak NG CLI (`espeak-ng.exe`, `libespeak-ng.dll`, `espeak-ng-data`) | GPL-3.0-or-later | Used by the Voice Builder for phonemization and pronunciation reference audio ([espeak-ng/espeak-ng](https://github.com/espeak-ng/espeak-ng)). |
+| wxPython (`wx`) | wxWindows Library Licence (LGPL-2.0 with binary exception) | Accessible desktop GUI framework for the Voice Builder ([wxWidgets/Phoenix](https://github.com/wxWidgets/Phoenix)). |
+| NumPy & SciPy | BSD-3-Clause | Signal resampling, autocorrelation F0 estimation, and audio analysis. |
+| `sounddevice` (PortAudio) & `soundfile` (libsndfile) | MIT / BSD-3-Clause / LGPL-2.1 | Microphone recording, audio playback, and WAV I/O in the Voice Builder. |
+| PyInstaller (packaging bootloader) | GPL-2.0 with bootloader exception | Used by `build-voicebuilder.ps1` to assemble the standalone Windows executable. |
+| Montreal Forced Aligner & micromamba (downloaded on demand) | MIT / BSD-3-Clause (MFA/Kaldi/micromamba) | **Not bundled** in the Voice Builder archive; downloaded on demand into `cache/` by the user. |
+| FrequencyWords word lists (downloaded on demand) | MIT / CC BY-SA 4.0 (OpenSubtitles derived) | **Not bundled**; downloaded on demand into `cache/wordlists/` from [hermitdave/FrequencyWords](https://github.com/hermitdave/FrequencyWords). |
+| Corpora and derived data (`output/`, `Voice_audio/`, `cache/`) | CC BY 4.0 for this project's own recordings and derivatives | **Not distributed.** These directories are excluded from the repository and release bundles; see README. |
 
 ## Not redistributed at all
 

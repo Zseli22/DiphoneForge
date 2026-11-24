@@ -87,7 +87,7 @@ EN_GB_CONSONANTS: List[str] = [
     "tS", "dZ",
     "f", "v", "T", "D", "s", "z", "S", "Z", "h",
     "m", "n", "N",
-    "l", "r", "w", "j",
+    "l", "L", "r", "w", "j",
 ]
 
 # Multi-phone expansions (mirroring phtrans two-phone splits) and allophone collapses.
@@ -108,7 +108,7 @@ EN_GB_NORM_BASE: Dict[str, Tuple[str, ...]] = {
     "@5": ("@",),
     "@/": ("@",),
     "@-": (),              # optional schwa dropped in en1_phtrans
-    "@L": ("@", "l"),      # syllabic l: table, people
+    "@L": ("@", "L"),      # syllabic dark l: table, people
     "aI@": ("aI", "@"),    # fire, tired (non-rhotic)
     "aI3": ("aI", "@"),
     "aU@": ("aU", "@"),    # hour, flour (non-rhotic)
@@ -128,14 +128,13 @@ EN_GB_NORM_BASE: Dict[str, Tuple[str, ...]] = {
     "r/": ("r",),
     "w/": ("w",),
     "w#": ("w",),
-    "l/2": ("l",),
-    "l/": ("l",),
-    "l/3": ("l",),
+    "l/2": ("L",),
+    "l/": ("L",),
+    "l/3": ("L",),
     "l^": ("l",),
-    "l.": ("l",),
-    "l-": ("l",),
-    "L": ("l",),
-    "L/": ("l",),
+    "l.": ("L",),
+    "l-": ("L",),
+    "L/": ("L",),
     "t2": ("t",),
     "t#": ("t",),
     "d#": ("d",),
@@ -160,7 +159,7 @@ EN_GB_IPA_DEFAULTS: Dict[str, str] = {
     "f": "f", "v": "v", "T": "θ", "D": "ð", "s": "s", "z": "z",
     "S": "ʃ", "Z": "ʒ", "h": "h",
     "m": "m", "n": "n", "N": "ŋ",
-    "l": "l", "r": "ɹ", "w": "w", "j": "j",
+    "l": "l", "L": "ɫ", "r": "ɹ", "w": "w", "j": "j",
 }
 
 
@@ -228,6 +227,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-words", type=int, default=500,
         help="Hard cap on selected real words (default: 500).",
+    )
+    parser.add_argument(
+        "--min-takes", type=int, default=1,
+        help="Target minimum takes per real-text diphone in greedy word cover (1 = compact, 2 = redundant 2x coverage).",
+    )
+    parser.add_argument(
+        "--extend-from", type=Path, default=None,
+        help="Optional existing plan dir (diphone_map.json) whose recorded lines are counted as already covered; "
+             "selects ONLY additional new words to append as an extension session.",
     )
     parser.add_argument(
         "--bath", choices=["auto", "A:", "a"], default="auto",
@@ -316,7 +324,7 @@ def get_normalization(voice: str, bath: str) -> Tuple[Optional[Set[str]], Option
         else:
             norm["aa"] = (bath,)
         return set(EN_GB_VOWELS), set(EN_GB_CONSONANTS), norm
-    return None, None, {";": (), "|": (), "!": (), "?": ()}
+    return None, None, {";": (), "|": (), "!": (), "?": (), "@-": (), "*": ()}
 
 
 def normalize_word_phones(
@@ -327,7 +335,8 @@ def normalize_word_phones(
 ) -> Optional[Tuple[Tuple[str, ...], Tuple[int, ...], Tuple[str, ...]]]:
     x_line = x_line.strip()
     ipa_line = ipa_line.strip()
-    if not x_line or " " in x_line or "[[" in x_line:
+    # Skip empty, multi-word, phoneme-escaped, or language-switched (e.g. "(en)...(es)") words
+    if not x_line or " " in x_line or "[[" in x_line or "(" in x_line:
         return None
 
     raw_x = [t for t in x_line.split("_") if t]
@@ -357,16 +366,24 @@ def normalize_word_phones(
             for j, m in enumerate(mapped):
                 phones.append(m)
                 stresses.append(stress if j == 0 else 0)
-                ipas.append(EN_GB_IPA_DEFAULTS.get(m, ipa_tok))
+                ipas.append(EN_GB_IPA_DEFAULTS.get(m, ipa_tok) if canonical is not None else ipa_tok)
         else:
             if canonical is not None and sym not in canonical:
                 return None  # skip word with unexpected foreign/broken symbol
             phones.append(sym)
             stresses.append(stress)
-            ipas.append(EN_GB_IPA_DEFAULTS.get(sym, ipa_tok))
+            ipas.append(EN_GB_IPA_DEFAULTS.get(sym, ipa_tok) if canonical is not None else ipa_tok)
 
     if len(phones) < 2:
         return None
+    # In British English (when both clear 'l' and dark 'L' are in the canonical inventory),
+    # mirror eSpeak NG's internal `l -> l/2` coda rule: 'l' before a non-vowel or word end -> 'L'.
+    if canonical is not None and "l" in canonical and "L" in canonical:
+        v_set = set(EN_GB_VOWELS)
+        for i in range(len(phones)):
+            if phones[i] == "l" and (i == len(phones) - 1 or phones[i + 1] not in v_set):
+                phones[i] = "L"
+                ipas[i] = "ɫ"
     return tuple(phones), tuple(stresses), tuple(ipas)
 
 
@@ -441,29 +458,37 @@ def greedy_set_cover(
     diphone_freq: Dict[str, int],
     max_words: int,
     target_coverage: float,
+    min_takes: int = 1,
+    initial_counts: Optional[Dict[str, int]] = None,
+    exclude_words: Optional[Set[str]] = None,
 ) -> Tuple[List[WordEntry], List[Dict[str, object]]]:
-    """Frequency-weighted greedy set cover with familiarity & length balance."""
-    # Sublinear frequency weight so high-frequency real-speech diphones are
-    # prioritized early without ignoring medium-frequency transitions.
+    """Frequency-weighted greedy set cover supporting k>=1 takes per diphone and additive extensions."""
     weights = {dp: math.log1p(diphone_freq.get(dp, 1)) ** 1.3 for dp in target_diphones}
     total_target_count = len(target_diphones)
     total_target_freq = sum(diphone_freq.get(dp, 0) for dp in target_diphones)
+    excl = exclude_words or set()
 
-    # Pre-filter each candidate's diphones to the target set
+    # Pre-filter each candidate's diphones to the target set & count how many candidates have each diphone
     cand_targets: List[List[Tuple[str, float]]] = []
     cand_cost: List[float] = []
+    avail_counts: collections.Counter[str] = collections.Counter(initial_counts or {})
     for c in candidates:
         hits = [(dp, q) for dp, q in c.diphones.items() if dp in target_diphones]
         cand_targets.append(hits)
-        # Cost gently prefers familiar, crisp 4-8 letter words over obscure/long words.
         rank_penalty = 1.0 + 0.12 * math.log1p(c.rank / 500.0)
         len_penalty = 1.0 + 0.04 * max(0, len(c.word) - 7)
         cand_cost.append(rank_penalty * len_penalty)
+        if c.word not in excl:
+            for dp, _ in hits:
+                avail_counts[dp] += 1
 
-    covered: Set[str] = set()
-    covered_freq = 0
+    need: Dict[str, int] = {dp: min(max(1, min_takes), max(1, avail_counts[dp])) for dp in target_diphones}
+    have: collections.Counter[str] = collections.Counter(initial_counts or {})
+    covered_1: Set[str] = {dp for dp in target_diphones if have[dp] >= 1}
+    covered_k: Set[str] = {dp for dp in target_diphones if have[dp] >= need[dp]}
+    covered_freq = sum(diphone_freq.get(dp, 0) for dp in covered_1)
     selected: List[WordEntry] = []
-    used_idx: Set[int] = set()
+    used_idx: Set[int] = {i for i, c in enumerate(candidates) if c.word in excl}
     curve: List[Dict[str, object]] = []
 
     while len(selected) < max_words:
@@ -477,8 +502,11 @@ def greedy_set_cover(
             gain = 0.0
             new_dps: List[str] = []
             for dp, q in hits:
-                if dp not in covered:
-                    gain += weights[dp] * q
+                cur_n = have[dp]
+                if cur_n < need[dp]:
+                    # First take weighted 1.0; subsequent redundancy takes weighted 0.65
+                    mult = 1.0 if cur_n == 0 else (0.65 ** cur_n)
+                    gain += weights[dp] * q * mult
                     new_dps.append(dp)
             if not new_dps:
                 continue
@@ -495,10 +523,15 @@ def greedy_set_cover(
         entry = candidates[best_i]
         selected.append(entry)
         for dp in best_new:
-            covered.add(dp)
-            covered_freq += diphone_freq.get(dp, 0)
+            was_zero = have[dp] == 0
+            have[dp] += 1
+            if was_zero:
+                covered_1.add(dp)
+                covered_freq += diphone_freq.get(dp, 0)
+            if have[dp] >= need[dp]:
+                covered_k.add(dp)
 
-        frac_types = len(covered) / total_target_count if total_target_count else 1.0
+        frac_types = (len(covered_k) if min_takes > 1 else len(covered_1)) / total_target_count if total_target_count else 1.0
         frac_tokens = covered_freq / total_target_freq if total_target_freq else 1.0
         curve.append({
             "step": len(selected),
@@ -506,7 +539,7 @@ def greedy_set_cover(
             "rank": entry.rank,
             "phones": " ".join(entry.phones),
             "new_diphones": len(best_new),
-            "cum_diphones": len(covered),
+            "cum_diphones": len(covered_1),
             "type_coverage": round(frac_types, 5),
             "token_coverage": round(frac_tokens, 5),
             "added": " ".join(sorted(best_new)),
@@ -669,6 +702,26 @@ def main() -> None:
         vowels = [v for v in EN_GB_VOWELS if v in phone_counts]
         consonants = [c for c in EN_GB_CONSONANTS if c in phone_counts]
     else:
+        # Filter rare foreign-loanword artifact phones (< 0.1% of scanned words)
+        min_phone_words = max(10, int(0.001 * len(entries)))
+        native_phones = {ph for ph, cnt in phone_counts.items() if cnt >= min_phone_words}
+        if len(native_phones) >= 12 and len(native_phones) < len(phone_counts):
+            dropped_phs = sorted(set(phone_counts) - native_phones)
+            print(f"Filtered {len(dropped_phs)} rare loanword phone(s) (<{min_phone_words} words): {dropped_phs}")
+            entries = [e for e in entries if all(p in native_phones for p in e.phones)]
+            phone_counts = collections.Counter()
+            diphone_word_count = collections.Counter()
+            diphone_freq = collections.Counter()
+            diphone_examples = collections.defaultdict(list)
+            for e in entries:
+                for ph in set(e.phones):
+                    phone_counts[ph] += 1
+                for dp in e.diphones:
+                    diphone_word_count[dp] += 1
+                    diphone_freq[dp] += e.freq
+                    if len(diphone_examples[dp]) < 5:
+                        diphone_examples[dp].append(e.word)
+
         ipa_vowel_chars = set("aeiouyɑɒæɐəɜɛɪɔøœʊʌʏʉɯɨɵɤ")
         vowels, consonants = [], []
         for ph, _ in phone_counts.most_common():
@@ -750,15 +803,33 @@ def main() -> None:
     print(f"Real-text diphones (all in vocab): {len(all_real_diphones)}")
     print(f"Real-text target diphones (>= {args.min_diphone_words} words): {len(target_diphones)}")
 
+    initial_counts: collections.Counter[str] = collections.Counter()
+    exclude_words: Set[str] = set()
+    if args.extend_from is not None:
+        ext_dmap = json.loads((args.extend_from / "diphone_map.json").read_text(encoding="utf-8"))
+        for item in ext_dmap.get("lines", []):
+            if item.get("kind") == "word":
+                exclude_words.add(str(item["text"]).lower())
+            phs = list(item.get("phones", []))
+            for a, b in zip(phs, phs[1:]):
+                initial_counts[f"{a}_{b}"] += 1
+            if phs:
+                initial_counts[f"_{phs[0]}"] += 1
+                initial_counts[f"{phs[-1]}_"] += 1
+        print(f"Extending from {args.extend_from}: {len(exclude_words)} existing words, {len(initial_counts)} diphones already present")
+
     selected, curve = greedy_set_cover(
         candidates=candidates,
         target_diphones=target_diphones,
         diphone_freq=diphone_freq,
         max_words=args.max_words,
         target_coverage=args.target_word_coverage,
+        min_takes=args.min_takes,
+        initial_counts=initial_counts,
+        exclude_words=exclude_words,
     )
 
-    covered_by_words: Set[str] = set()
+    covered_by_words: Set[str] = set(initial_counts.keys())
     for e in selected:
         covered_by_words.update(e.diphones.keys())
 

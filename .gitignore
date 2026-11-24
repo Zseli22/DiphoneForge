@@ -1,6 +1,7 @@
 # Private working data: never committed
 Voice_audio/
 output/
+cache/
 
 # Build artefacts
 build/

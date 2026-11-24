@@ -43,16 +43,25 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
+PROJECT_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else SCRIPT_DIR.parent
 
-sys.path.insert(0, str(SCRIPT_DIR))
+if not getattr(sys, "frozen", False) and str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 from resegment_from_whole_alignment import parse_textgrid  # noqa: E402
 
-ANAF0 = PROJECT_ROOT / "tools" / "mbrolator-src" / "AnaMBE" / "Obj" / "anaf0.exe"
-ANAMBE = PROJECT_ROOT / "tools" / "mbrolator-src" / "AnaMBE" / "Obj" / "anambe.exe"
-RESYNTH = PROJECT_ROOT / "tools" / "mbrolator-src" / "Resynthesis" / "resynth.exe"
-DATABASE_BUILD = PROJECT_ROOT / "tools" / "mbrolator-src" / "Resynthesis" / "database_build.exe"
-MBROLA = PROJECT_ROOT / "tools" / "mbrola-src" / "Bin" / "mbrola.exe"
+
+def _resolve_tool(flat_name: str, repo_rel: str) -> Path:
+    flat = PROJECT_ROOT / "tools" / "mbrolator" / flat_name
+    if flat.is_file():
+        return flat
+    return PROJECT_ROOT / repo_rel
+
+
+ANAF0 = _resolve_tool("anaf0.exe", "tools/mbrolator-src/AnaMBE/Obj/anaf0.exe")
+ANAMBE = _resolve_tool("anambe.exe", "tools/mbrolator-src/AnaMBE/Obj/anambe.exe")
+RESYNTH = _resolve_tool("resynth.exe", "tools/mbrolator-src/Resynthesis/resynth.exe")
+DATABASE_BUILD = _resolve_tool("database_build.exe", "tools/mbrolator-src/Resynthesis/database_build.exe")
+MBROLA = _resolve_tool("mbrola.exe", "tools/mbrola-src/Bin/mbrola.exe")
 
 # MBROLATOR analysis always keeps Freq=16000 even for 22.05 kHz databases;
 # FrameShift/FrameLength/period scale to the speaker's F0 at the target rate,
@@ -98,7 +107,7 @@ IPA_CONS_BASE = {
     "f": (2, 3, 0), "v": (2, 3, 1), "ʋ": (2, 6, 1),
     "θ": (3, 3, 0), "ð": (3, 3, 1),
     "t": (4, 1, 0), "d": (4, 1, 1), "s": (4, 3, 0), "z": (4, 3, 1),
-    "n": (4, 4, 1), "l": (4, 5, 1), "ɫ": (4, 5, 1), "r": (4, 5, 1), "ɹ": (4, 5, 1), "ɾ": (4, 5, 1),
+    "n": (4, 4, 1), "l": (4, 5, 1), "ɫ": (4.4, 5, 1), "r": (4, 5, 1), "ɹ": (4, 5, 1), "ɾ": (4, 5, 1),
     "ʃ": (5, 3, 0), "ʒ": (5, 3, 1), "tʃ": (5, 2, 0), "dʒ": (5, 2, 1), "ts": (4, 2, 0), "dz": (4, 2, 1),
     "c": (6, 1, 0), "ɟ": (6, 1, 1), "ç": (6, 3, 0), "ɲ": (6, 4, 1), "ʎ": (6, 5, 1), "j": (6, 6, 1),
     "k": (7, 1, 0), "ɡ": (7, 1, 1), "g": (7, 1, 1), "x": (7, 3, 0), "ɣ": (7, 3, 1), "ŋ": (7, 4, 1),
@@ -314,7 +323,9 @@ def build_unit_grid(
         post_e = min(len(src_mono), int((src_start + word_end + 0.12) * sr))
         noise_db = min(db_level(src_mono[pre_s:pre_e]), db_level(src_mono[post_s:post_e]))
 
-        # Collect vowel F0s for speaker median F0
+        # Collect voiced vowel F0 frames across the whole corpus for true natural
+        # conversational median F0 (avoids skewing upward into citation-form emphasis)
+        n_ph = len(canon)
         for ph, ps, pe in canon:
             if ph in vowels and (pe - ps) >= 0.055:
                 i0 = max(0, int((src_start + ps) * sr))
@@ -322,7 +333,6 @@ def build_unit_grid(
                 corpus_vowel_f0.extend(estimate_f0_frames(src_mono[i0:i1], sr))
 
         # Extract every consecutive diphone pair in this word/supplement
-        n_ph = len(canon)
         for i in range(n_ph - 1):
             p1, p1_s, p1_e = canon[i]
             p2, p2_s, p2_e = canon[i + 1]
@@ -383,51 +393,89 @@ def build_unit_grid(
         "voiced_frames": len(corpus_vowel_f0),
     }
 
-    # Score every candidate take (preferring clean SNR, solid phone durations,
-    # medial/stressed position, steady voicing near speaker median F0)
-    snrs = [float(r["snr_db"]) for r in rows]
-    snr_mu, snr_sd = statistics.mean(snrs), statistics.pstdev(snrs) or 1.0
+    # Score every candidate take using a balanced, neutral-voice acoustic formula:
+    #   1. Clean SNR floor + clipping guard (saturates at 28 dB)
+    #   2. Natural conversational loudness centered on corpus median RMS (penalizing
+    #      BOTH whispered/fading tails AND shouted/emphasized spikes)
+    #   3. Anti-reduction steady-state duration clarity (saturates cleanly at 120 ms)
+    #   4. Natural unemphasized speaking pitch near speaker's neutral median F0
+    #      (penalizes creaky drops AND strongly accented high-pitch syllables that
+    #      cause vocoder artifacts when synthesized at neutral pitch)
+    #   5. Gentle stress & word-familiarity tie-breakers
     med_rms = statistics.median(float(r["rms_db"]) for r in rows)
     spk_f0 = f0_stats["median_hz"]
 
     for r in rows:
-        score = 0.8 * ((float(r["snr_db"]) - snr_mu) / snr_sd)
-        min_d = min(float(r["phone1_duration_s"]), float(r["phone2_duration_s"]))
+        snr = float(r["snr_db"])
+        d1 = float(r["phone1_duration_s"])
+        d2 = float(r["phone2_duration_s"])
+        min_d = min(d1, d2)
+        max_d = max(d1, d2)
+        peak = float(r["peak"])
+        rms = float(r["rms_db"])
+        f0_med = float(r["f0_median_hz"])
+        f0_std = float(r["f0_std_hz"])
+
+        score = 0.0
+
+        # 1. Clean SNR floor + clipping guard
+        if snr < 18.0:
+            score -= 2.0 * (18.0 - snr) / 6.0
+        else:
+            score += 0.60 * min(1.0, (snr - 18.0) / 10.0)
+        if peak > 0.92:
+            score -= 3.0
+
+        # 2. Natural conversational loudness (penalize whispered drops & shouted spikes)
+        rms_diff = rms - med_rms
+        if rms_diff < -3.5:
+            score -= min(1.4, 0.20 * (-3.5 - rms_diff))
+        elif rms_diff > 5.0:
+            score -= min(0.9, 0.16 * (rms_diff - 5.0))
+        else:
+            score += 0.30
+
+        # 3. Anti-reduction & steady-state duration clarity (saturates cleanly at 120 ms)
         if min_d < 0.030:
             score -= 2.0
-        elif min_d < 0.045:
-            score -= 0.7
-        if float(r["peak"]) > 0.92:
-            score -= 3.0
-        if abs(float(r["rms_db"]) - med_rms) > 8.0:
-            score -= 1.0
+        elif min_d < 0.048:
+            score -= 0.9
+        elif min_d < 0.060:
+            score -= 0.3
+
+        dur_r1 = min(1.0, max(0.0, (d1 - 0.050) / 0.070))
+        dur_r2 = min(1.0, max(0.0, (d2 - 0.050) / 0.070))
+        score += 0.50 * (dur_r1 + dur_r2)
+        if max_d > 0.360:
+            score -= 0.5
+
+        # 4. Natural unemphasized speaking pitch & steadiness (normalized by speaker F0)
+        if f0_med > 0:
+            ratio = f0_med / spk_f0
+            if ratio < 0.85:
+                score -= 0.7  # creaky drop
+            elif ratio > 1.32:
+                # Emphasized/accented high pitch (sounds vocoded when pitched back down)
+                score -= min(1.0, 0.65 * (ratio - 1.32) / 0.20 + 0.25)
+            elif 0.92 <= ratio <= 1.22:
+                score += 0.35  # relaxed conversational speaking pitch
+
+            rel_std = f0_std / spk_f0
+            if rel_std > 0.03:
+                score -= min(0.8, 0.65 * (rel_std - 0.03) / 0.06)
+
+        # 5. Gentle stress & familiarity tie-breakers
         if r["is_stressed"]:
-            score += 0.55
-        if r["is_medial"]:
-            score += 0.35
-        elif r["is_final"] and not r["is_stressed"]:
-            score -= 0.45
-        if float(r["f0_median_hz"]) > 0:
-            rel_f0 = abs(float(r["f0_median_hz"]) - spk_f0) / spk_f0
-            if rel_f0 > 0.25:
-                score -= 1.0
-            elif rel_f0 < 0.12:
-                score += 0.25
-        if float(r["f0_std_hz"]) > 25.0:
-            score -= 0.6
-        # Language-neutral familiarity preference: common high-frequency words
-        # have far more consistent speaker/frontend agreement than obscure tail
-        # words or foreign proper names from subtitle frequency lists.
+            score += 0.12
         if r["kind"] == "word":
             rank = int(r.get("vocab_rank", 99999))
-            if rank <= 1500:
-                score += 1.00
-            elif rank <= 4000:
-                score += 0.65
-            elif rank <= 7500:
-                score += 0.25
-            else:
-                score -= 0.70
+            if rank <= 5000:
+                score += 0.15
+            elif rank > 15000:
+                score -= 0.20
+        else:
+            score -= 0.30
+
         r["score"] = round(score, 4)
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -436,19 +484,25 @@ def build_unit_grid(
         w.writeheader()
         w.writerows(rows)
 
-    print(f"Unit grid: {len(rows)} diphone takes across {len(segments) - skipped}/{len(segments)} aligned lines (skipped={skipped})")
-    print(f"Speaker F0 (from {f0_stats['voiced_frames']} vowel frames): median={f0_stats['median_hz']} Hz (p10={f0_stats['p10_hz']}, p90={f0_stats['p90_hz']})")
+    print(f"Unit grid: {len(rows)} diphone takes across {len(segments) - skipped}/{len(segments)} aligned lines (skipped={skipped})", flush=True)
+    print(f"Speaker F0 (from {f0_stats['voiced_frames']} vowel frames): median={f0_stats['median_hz']} Hz (p10={f0_stats['p10_hz']}, p90={f0_stats['p90_hz']})", flush=True)
     return rows, f0_stats
 
 
-def select_takes(rows: List[Dict[str, object]]) -> Tuple[Dict[str, Dict[str, object]], List[Dict[str, object]]]:
+def select_takes(
+    rows: List[Dict[str, object]],
+    overrides: Optional[Dict[str, int]] = None,
+) -> Tuple[Dict[str, Dict[str, object]], List[Dict[str, object]]]:
     by_label: Dict[str, List[Dict[str, object]]] = collections.defaultdict(list)
     for r in rows:
         by_label[str(r["diphone"])].append(r)
+    ov = overrides or {}
     chosen: Dict[str, Dict[str, object]] = {}
     report: List[Dict[str, object]] = []
     for label, takes in sorted(by_label.items()):
-        winner = max(takes, key=lambda r: (float(r["score"]), -int(r["line"])))
+        pinned_line = ov.get(label)
+        pinned = next((t for t in takes if int(t["line"]) == pinned_line), None) if pinned_line is not None else None
+        winner = pinned if pinned is not None else max(takes, key=lambda r: (float(r["score"]), -int(r["line"])))
         chosen[label] = winner
         report.append({
             "diphone": label,
@@ -460,6 +514,7 @@ def select_takes(rows: List[Dict[str, object]]) -> Tuple[Dict[str, Dict[str, obj
             "f0_hz": float(winner["f0_median_hz"]),
             "stressed": int(winner["is_stressed"]),
             "medial": int(winner["is_medial"]),
+            "pinned": int(pinned is not None),
         })
     return chosen, report
 
@@ -822,11 +877,19 @@ def peak_of(path: Path) -> int:
     return max((abs(v) for v in data), default=0)
 
 
-def scale_outputs(paths: Iterable[Path], gain: float) -> None:
+def scale_outputs(paths: Iterable[Path], base_gain: float, peak_limit: float = MAX_PEAK_FRACTION * 32767.0) -> int:
+    """Apply uniform `base_gain` across units, capping only rare peak outliers to prevent clipping."""
+    capped = 0
     for path in paths:
         data = array.array("h")
         data.frombytes(path.read_bytes())
-        path.write_bytes(array.array("h", (max(-32768, min(32767, int(round(v * gain)))) for v in data)).tobytes())
+        pk = max((abs(v) for v in data), default=0)
+        g = base_gain
+        if pk > 0 and pk * base_gain > peak_limit:
+            g = peak_limit / float(pk)
+            capped += 1
+        path.write_bytes(array.array("h", (max(-32768, min(32767, int(round(v * g)))) for v in data)).tobytes())
+    return capped
 
 
 def validate_db(db_path: Path, manifest: List[Dict[str, object]], out_dir: Path) -> List[Dict[str, object]]:
@@ -957,6 +1020,7 @@ def main() -> int:
     parser.add_argument("--rate", type=int, default=16000, choices=[16000, 22050])
     parser.add_argument("--jobs", type=int, default=max(1, min(8, (os.cpu_count() or 4) - 1)))
     parser.add_argument("--period-override", type=int, default=0, help="Optional manual pitch period override (0 = auto from speaker F0)")
+    parser.add_argument("--take-overrides", type=Path, default=None, help="Optional JSON mapping diphone -> pinned line number")
     args = parser.parse_args()
 
     for tool in (ANAF0, ANAMBE, RESYNTH, DATABASE_BUILD, MBROLA):
@@ -1014,19 +1078,24 @@ def main() -> int:
     (build_dir / f"{args.name}.syn").write_text(SYN_PARAMS, encoding="ascii")
 
     # 3. Take selection, edges, fallbacks
-    chosen, sel_report = select_takes(rows)
+    take_overrides: Dict[str, int] = {}
+    if args.take_overrides and args.take_overrides.is_file():
+        raw_ov = json.loads(args.take_overrides.read_text(encoding="utf-8"))
+        take_overrides = {str(k): int(v) for k, v in raw_ov.items()}
+        print(f"Loaded {len(take_overrides)} pinned take override(s) from {args.take_overrides}")
+    chosen, sel_report = select_takes(rows, overrides=take_overrides)
     with (out_root / "take_selection.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(sel_report[0].keys()))
         w.writeheader()
         w.writerows(sel_report)
-    print(f"Selected {len(chosen)} unique recorded diphones from {len(rows)} takes")
+    print(f"Selected {len(chosen)} unique recorded diphones from {len(rows)} takes", flush=True)
 
     sources = prepare_sources(args.rate, build_dir, args.audio_dir, segments)
     naturals = [natural_spec(lbl, r, segments[int(r["line"])]) for lbl, r in sorted(chosen.items())]
     edges = edge_specs(phones, rows, segments, sources, args.rate)
     fallbacks = fallback_specs(phones, rows, segments, chosen, dist_fn)
     specs = naturals + edges + fallbacks
-    print(f"Matrix units: {len(naturals)} recorded + {len(edges)} edges + {len(fallbacks)} cross-spliced = {len(specs)} total")
+    print(f"Matrix units: {len(naturals)} recorded + {len(edges)} edges + {len(fallbacks)} cross-spliced = {len(specs)} total", flush=True)
 
     # 4. Run MBROLATOR analysis & resynthesis in parallel
     jobs = [(idx, sp) for idx, sp in enumerate(specs)]
@@ -1047,7 +1116,7 @@ def main() -> int:
                 failures.append(f"{j[1]['label']}: {exc}")
                 print(f"  FAILED {j[1]['label']}: {exc}", flush=True)
             done += 1
-            if done % 250 == 0 or done == len(jobs):
+            if done % 50 == 0 or done == len(jobs):
                 print(f"  analyzed {done}/{len(jobs)} units", flush=True)
 
     results.sort(key=lambda x: int(x["index"]))
@@ -1055,13 +1124,18 @@ def main() -> int:
         (out_root / "build_failures.txt").write_text("\n".join(failures) + "\n", encoding="utf-8")
         print(f"WARNING: {len(failures)} unit failures (see build_failures.txt)", file=sys.stderr)
 
-    # 5. Pad, gain-scale, write .seg & manifest, pack database
-    for item in results:
-        pad_s16(Path(str(item["s16"])), period)
-    max_peak = max(peak_of(Path(str(item["s16"]))) for item in results)
-    gain = RESYNTH_GAIN if max_peak == 0 else min(RESYNTH_GAIN, MAX_PEAK_FRACTION * 32767.0 / max_peak)
-    scale_outputs((Path(str(item["s16"])) for item in results), gain)
-    print(f"Gain={gain:.3f} (peak before gain={max_peak})")
+    # 5. Pad, gain-scale (using p99 peak so 1-2 isolated plosive spikes cannot drag down
+    # the entire voice bank's loudness, while capping rare outliers cleanly below clip), pack database
+    s16_paths = [Path(str(item["s16"])) for item in results]
+    for p in s16_paths:
+        pad_s16(p, period)
+    peaks = sorted(peak_of(p) for p in s16_paths)
+    max_peak = peaks[-1] if peaks else 0
+    p99_peak = peaks[int(0.99 * (len(peaks) - 1))] if peaks else 0
+    ref_peak = p99_peak if p99_peak > 0 else max_peak
+    gain = RESYNTH_GAIN if ref_peak == 0 else min(RESYNTH_GAIN, MAX_PEAK_FRACTION * 32767.0 / ref_peak)
+    capped_units = scale_outputs(s16_paths, gain)
+    print(f"Gain={gain:.3f} (p99_peak={p99_peak}, max_peak={max_peak}, headroom_capped={capped_units})", flush=True)
 
     seg_lines = []
     manifest = []
@@ -1088,7 +1162,7 @@ def main() -> int:
     db_path = build_dir / args.name
     if not db_path.exists() or db_path.stat().st_size == 0:
         raise RuntimeError("database_build did not produce database file")
-    print(f"Packed {db_path} ({db_path.stat().st_size / 1e6:.2f} MB)")
+    print(f"Packed {db_path} ({db_path.stat().st_size / 1e6:.2f} MB)", flush=True)
 
     # 6. Validate all units through mbrola.exe
     print("Validating all units through mbrola.exe...", flush=True)

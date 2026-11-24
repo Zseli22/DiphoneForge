@@ -9,27 +9,26 @@ tomorrow.
 1. **The NVDA add-on.** A 64-bit eSpeak NG synthesizer that drives MBROLA voices
    through a 32-bit helper process, shipped with one complete voice built from
    this project's own recordings.
-2. **The voice builder.** The scripts that turn a prompt list and a set of
-   recordings into a finished MBROLA database, including a matching eSpeak voice
-   descriptor and phone translation table. It is currently a collection of
-   command-line stages; turning it into a guided, interactive workflow is the
-   next major piece of work.
+2. **The voice builder (`voicebuilder/`).** An accessible, language- and
+   speaker-neutral wxPython desktop wizard (plus CLI) that turns a frequency
+   word list and your recordings (via the built-in PC microphone studio or an
+   external recorder) into a complete, NVDA-ready MBROLA database, eSpeak voice
+   descriptor, and phone translation table across 36 languages.
 
-The long-term goal is that someone with a microphone, or with recordings made
-elsewhere, can generate a recording script for their language, import what they
-recorded, and end up with a voice that NVDA can use, without needing to
-understand MBROLA's internals or ask anyone for help.
+The goal is that someone with a microphone, or with recordings made elsewhere,
+can generate a compact real-word recording script for their language, record or
+import it, audit and cherry-pick diphone takes, and end up with a voice that
+NVDA can use, without needing to understand MBROLA's internals.
 
 ## Status
 
 | Component | State |
 | --- | --- |
 | NVDA add-on, eSpeak NG 1.51 + MBROLA, 64-bit | **Complete and in daily use** |
-| USD16 voice database, 16 kHz | **Complete**, accepted on listening |
-| USD voice database, 22.05 kHz | **Complete**, proof of concept for higher rates |
-| Voice builder as a pipeline of stages | Working scripts, project-specific, English only |
-| Voice builder as a guided application | Not started; design in `docs/voice_builder_plan.md` |
-| Additional languages | Not started |
+| USD16 (16 kHz) & USD (22.05 kHz) voice databases | **Complete**, shipped in add-on |
+| Reusable Voice Builder GUI & CLI (`voicebuilder/`) | **Working beta**, 36 MFA-supported languages, portable Windows `.exe` via `build-voicebuilder.ps1` |
+| Hybrid real-word + minimal-pair prompt planner & corpus extender | **Complete**, supports `1x`, `2x`, and incremental `+extra words` extensions |
+| Interactive Diphone Take Picker | **Complete**, acoustic-first auto-scoring + per-diphone manual pinning |
 
 ## What the add-on gives you
 
@@ -148,25 +147,32 @@ toolchain available produces both native binaries from source, which is what
 keeps the GPL and AGPL source obligations satisfied. `tools\compare-install.ps1`
 checks an installed add-on against `build\stage` file by file.
 
-## Building a voice
+## Building a voice (DiphoneForge Voice Builder)
 
-The current pipeline, in the order it runs:
+The guided Voice Builder supports **36 languages** (all MFA acoustic models listed
+in `data/language_catalog.json`), both **Built-in PC Microphone Studio** and
+**External Recorder Import** (including partial pickup patching and incremental
+corpus extensions), an **Interactive Diphone Take Picker**, and one-click preview
+& installation into NVDA's `espeakWitMbrola` add-on.
 
-| Stage | Script | Output |
-| --- | --- | --- |
-| Plan the corpus | `tools/generate_recording_script.py` | prompts, transcripts, diphone map |
-| Pronunciation reference | `tools/render_prompt_reference.py` | one WAV per prompt, a continuous track, an index |
-| Record | (any recorder) | WAV files plus a line-range file |
-| Segment and align | `tools/make_mfa_corpus.py`, `tools/build_mfa_dictionary.py`, `tools/resegment_from_whole_alignment.py` | per-line clips, TextGrids |
-| Build the unit grid | `tools/build_unit_grid.py` | diphone labels and boundaries |
-| Audit | `tools/audit_units.py`, `tools/analyze_unit_grid.py` | quality reports, pickup lists |
-| Build the database | `tools/build_mbrola_db.py` | MBROLA database, manifest, reports |
-| Package the voice | `tools/make_espeak_voice.py`, the `voices/` layout | descriptor, phtrans, `.voice` |
+### Running from the portable Windows release
+Download and extract `DiphoneForge-VoiceBuilder-<version>-win64.zip` from the
+Releases page and launch `DiphoneForgeVoiceBuilder.exe`. Word lists, Montreal
+Forced Aligner, and per-language acoustic models are downloaded automatically on
+demand into the portable `cache\` folder next to the executable.
 
-Three things a new user has to do by hand today, and that the guided builder is
-meant to remove: deciding how many prompts to record, mapping recorded files to
-script lines, and judging which takes are worth keeping. Everything else is
-automatic and rule-based; no AI assistance is involved or planned.
+### Running from source or building the portable executable
+```powershell
+python -m voicebuilder               # launch the accessible wxPython wizard
+python -m voicebuilder languages     # list all 36 supported languages
+python -m voicebuilder doctor        # check bundled tools and MFA status
+.\build-voicebuilder.ps1             # assemble dist\DiphoneForge-VoiceBuilder-<ver>-win64.zip
+```
+
+Behind the scenes, the wizard orchestrates the modular pipeline scripts in
+`tools/` (`plan_word_corpus.py`, `resegment_from_whole_alignment.py`,
+`build_word_mbrola_db.py`, `smoke_mbrola_host.py`). Everything is deterministic
+and acoustic/rule-based; no neural TTS or AI voice cloning is involved.
 
 ## The reference build
 
