@@ -20,7 +20,27 @@ def _main() -> int:
                 stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
             except Exception:
                 pass
+    is_tool = len(sys.argv) >= 2 and sys.argv[1] == "--_run-tool"
     from voicebuilder.__main__ import main
+
+    if is_tool:
+        try:
+            res = main()
+            return int(res) if isinstance(res, int) else 0
+        except SystemExit as exc:
+            code = exc.code
+            if code is None:
+                return 0
+            if isinstance(code, int):
+                return code
+            print(str(code), file=sys.stderr, flush=True)
+            return 1
+        except Exception:
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            return 1
 
     return main()
 

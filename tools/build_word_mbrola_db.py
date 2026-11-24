@@ -238,7 +238,40 @@ def read_abs(path: Path, rate: int, t0: float, t1: float) -> np.ndarray:
     frames = max(1, int(round((t1 - t0) * rate)))
     frames = min(frames, max(1, info.frames - start))
     data, _ = sf.read(key, start=start, frames=frames, dtype="float32", always_2d=False)
-    return np.asarray(data, dtype=np.float32)
+    return np.asarray(data, dtype=np.float32).reshape(-1)
+
+
+def read_abs_padded(path: Path, rate: int, t0: float, t1: float) -> np.ndarray:
+    """Read [t0, t1) seconds on the source timeline, zero-padding past [0, total] so indices stay exact."""
+    key = str(path)
+    info = _INFO_CACHE.get(key)
+    if info is None:
+        info = sf.info(key)
+        _INFO_CACHE[key] = info
+    s0 = int(round(t0 * rate))
+    s1 = int(round(t1 * rate))
+    if s1 <= s0:
+        s1 = s0 + 1
+    n_total = s1 - s0
+    r0 = max(0, min(s0, info.frames))
+    r1 = max(r0, min(s1, info.frames))
+    pre_pad = max(0, r0 - s0)
+    if r1 > r0:
+        data, _ = sf.read(key, start=r0, frames=r1 - r0, dtype="float32", always_2d=False)
+        core = np.asarray(data, dtype=np.float32).reshape(-1)
+    else:
+        core = np.zeros(0, dtype=np.float32)
+    post_pad = max(0, n_total - pre_pad - len(core))
+    if pre_pad == 0 and post_pad == 0 and len(core) == n_total:
+        return core
+    parts: List[np.ndarray] = []
+    if pre_pad > 0:
+        parts.append(np.zeros(pre_pad, dtype=np.float32))
+    if len(core) > 0:
+        parts.append(core[: max(0, n_total - pre_pad)])
+    if post_pad > 0:
+        parts.append(np.zeros(post_pad, dtype=np.float32))
+    return np.concatenate(parts) if parts else np.zeros(n_total, dtype=np.float32)
 
 
 def prepare_sources(rate: int, work_dir: Path, audio_dir: Path, segments: Dict[int, Dict[str, str]]) -> Dict[str, Path]:
@@ -551,7 +584,99 @@ def natural_spec(label: str, row: Dict[str, object], seg: Dict[str, str]) -> Dic
     }
 
 
-def splice_edge(phone: str, side: str, rows: List[Dict[str, object]], segments: Dict[int, Dict[str, str]]) -> Dict[str, object]:
+def _source_total_s(path: Path) -> float:
+    key = str(path)
+    info = _INFO_CACHE.get(key)
+    if info is None:
+        info = sf.info(key)
+        _INFO_CACHE[key] = info
+    return info.frames / float(info.samplerate)
+
+
+def build_corpus_room_tone(
+    rows: List[Dict[str, object]],
+    segments: Dict[int, Dict[str, str]],
+    sources: Dict[str, Path],
+    rate: int,
+    build_dir: Path,
+) -> Path:
+    """Extract a guaranteed TONE_LENGTH quiet room-tone clip across the corpus (or -68 dBFS floor)."""
+    target_n = int(round(TONE_LENGTH * rate))
+    min_short_n = max(64, int(round(0.04 * rate)))
+    line_bounds: Dict[int, Tuple[float, float]] = {}
+    for r in rows:
+        ln = int(r["line"])
+        if ln not in line_bounds:
+            line_bounds[ln] = (float(r["word_start_s"]), float(r["word_end_s"]))
+
+    best_full: Optional[Tuple[float, np.ndarray]] = None
+    best_short: Optional[Tuple[float, np.ndarray]] = None
+
+    for ln, (ws, we) in sorted(line_bounds.items()):
+        seg = segments[ln]
+        path = sources[seg["source_wav"]]
+        total = _source_total_s(path)
+        start = float(seg["source_start_s"])
+        windows: List[Tuple[float, float]] = []
+        pre_avail = start + ws
+        if pre_avail >= 0.04:
+            dur = min(TONE_LENGTH, pre_avail)
+            windows.append((pre_avail - dur, pre_avail))
+        post_start = start + we
+        post_avail = total - post_start
+        if post_avail >= 0.04:
+            dur = min(TONE_LENGTH, post_avail)
+            windows.append((post_start, post_start + dur))
+
+        for t0, t1 in windows:
+            arr = read_abs(path, rate, t0, t1)
+            if len(arr) < min_short_n:
+                continue
+            lvl = db_level(arr)
+            # Prefer real quiet room tone (-75..-38 dB) over pure digital zero if available
+            rank_score = lvl if lvl > -85.0 else -42.0
+            if len(arr) >= target_n - 4 and lvl <= -38.0:
+                if best_full is None or rank_score < best_full[0]:
+                    best_full = (rank_score, arr)
+            elif lvl <= -35.0:
+                short_score = rank_score - min(10.0, (len(arr) / float(target_n)) * 10.0)
+                if best_short is None or short_score < best_short[0]:
+                    best_short = (short_score, arr)
+
+    if best_full is not None:
+        arr = best_full[1]
+        if len(arr) >= target_n:
+            tone = arr[:target_n].astype(np.float32)
+        else:
+            tone = np.pad(arr.astype(np.float32), (0, target_n - len(arr)))
+    elif best_short is not None:
+        piece = best_short[1].astype(np.float32)
+        ov = min(int(0.010 * rate), max(1, len(piece) // 4))
+        tone = piece.copy()
+        while len(tone) < target_n:
+            if ov >= 4 and len(tone) > ov and len(piece) > ov:
+                tone = np.concatenate([tone[:-ov], xfade(tone[-ov:], piece[:ov], ov), piece[ov:]])
+            else:
+                tone = np.concatenate([tone, piece])
+        tone = tone[:target_n]
+    else:
+        rng = np.random.default_rng(12345)
+        tone = rng.normal(0.0, 4e-4, size=target_n).astype(np.float32)
+
+    room_tone_path = build_dir / "room_tone.wav"
+    sf.write(str(room_tone_path), tone, rate, subtype="PCM_16")
+    _INFO_CACHE.pop(str(room_tone_path), None)
+    return room_tone_path
+
+
+def splice_edge(
+    phone: str,
+    side: str,
+    rows: List[Dict[str, object]],
+    segments: Dict[int, Dict[str, str]],
+    sources: Dict[str, Path],
+    rate: int,
+) -> Dict[str, object]:
     cands = [r for r in rows if r["phone1"] == phone or r["phone2"] == phone]
     cands.sort(key=lambda r: (-float(r["score"]), int(r["line"])))
     if side == "initial":
@@ -563,15 +688,23 @@ def splice_edge(phone: str, side: str, rows: List[Dict[str, object]], segments: 
         else:
             ps, pe = float(row["phone2_start_s"]), float(row["phone2_end_s"])
         mid = ps + (pe - ps) / 2.0
+        tone_end = start + float(row["word_start_s"])
+        tone_start = tone_end - TONE_LENGTH
+        src_path = sources[seg["source_wav"]]
+        if tone_start >= 0.0 and db_level(read_abs(src_path, rate, tone_start, tone_end)) <= -40.0:
+            tone_source = seg["source_wav"]
+        else:
+            tone_source = "__room_tone__"
+            tone_start, tone_end = 0.0, TONE_LENGTH
         return {
             "label": f"_{phone}", "kind": "initial", "left": "_", "right": phone,
             "line": int(row["line"]), "source_file": seg["source_wav"], "source_start": start,
             "note": "spliced room tone + first half",
             "splice": {
                 "mode": "tone_then_half", "source": seg["source_wav"],
+                "tone_source": tone_source,
                 "half_start": start + ps, "half_end": start + mid,
-                "tone_start": max(0.0, start + float(row["word_start_s"]) - TONE_LENGTH),
-                "tone_end": start + float(row["word_start_s"]),
+                "tone_start": tone_start, "tone_end": tone_end,
             },
         }
     row = next((r for r in cands if r["phone2"] == phone), cands[0])
@@ -582,15 +715,24 @@ def splice_edge(phone: str, side: str, rows: List[Dict[str, object]], segments: 
     else:
         ps, pe = float(row["phone1_start_s"]), float(row["phone1_end_s"])
     mid = ps + (pe - ps) / 2.0
+    src_path = sources[seg["source_wav"]]
+    total = _source_total_s(src_path)
+    tone_start = start + float(row["word_end_s"])
+    tone_end = tone_start + TONE_LENGTH
+    if tone_end <= total and db_level(read_abs(src_path, rate, tone_start, tone_end)) <= -40.0:
+        tone_source = seg["source_wav"]
+    else:
+        tone_source = "__room_tone__"
+        tone_start, tone_end = 0.0, TONE_LENGTH
     return {
         "label": f"{phone}_", "kind": "final", "left": phone, "right": "_",
         "line": int(row["line"]), "source_file": seg["source_wav"], "source_start": start,
         "note": "spliced second half + room tone",
         "splice": {
             "mode": "half_then_tone", "source": seg["source_wav"],
+            "tone_source": tone_source,
             "half_start": start + mid, "half_end": start + pe,
-            "tone_start": start + float(row["word_end_s"]),
-            "tone_end": start + float(row["word_end_s"]) + TONE_LENGTH,
+            "tone_start": tone_start, "tone_end": tone_end,
         },
     }
 
@@ -601,7 +743,11 @@ def edge_specs(
     segments: Dict[int, Dict[str, str]],
     sources: Dict[str, Path],
     rate: int,
+    build_dir: Optional[Path] = None,
 ) -> List[Dict[str, object]]:
+    tone_dir = build_dir if build_dir is not None else next(iter(sources.values())).parent
+    sources["__room_tone__"] = build_corpus_room_tone(rows, segments, sources, rate, tone_dir)
+
     initial: Dict[str, List[Dict[str, object]]] = collections.defaultdict(list)
     final: Dict[str, List[Dict[str, object]]] = collections.defaultdict(list)
     for r in rows:
@@ -610,17 +756,27 @@ def edge_specs(
         if abs(float(r["phone2_end_s"]) - float(r["word_end_s"])) < 1e-4:
             final[str(r["phone2"])].append(r)
 
+    min_sil_samples = int(0.9 * SILENCE_HALF * rate)
+
     def tone_db(r: Dict[str, object], side: str) -> float:
         seg = segments[int(r["line"])]
         path = sources[seg["source_wav"]]
+        total = _source_total_s(path)
         start = float(seg["source_start_s"])
         if side == "pre":
-            t0 = start + float(r["word_start_s"]) - SILENCE_HALF
             t1 = start + float(r["word_start_s"])
+            t0 = t1 - SILENCE_HALF
+            if t0 < 0.0:
+                return 0.0
         else:
             t0 = start + float(r["word_end_s"])
             t1 = t0 + SILENCE_HALF
-        return db_level(read_abs(path, rate, t0, t1))
+            if t1 > total:
+                return 0.0
+        arr = read_abs(path, rate, t0, t1)
+        if len(arr) < min_sil_samples:
+            return 0.0
+        return db_level(arr)
 
     specs: List[Dict[str, object]] = []
     for ph in phones:
@@ -644,7 +800,7 @@ def edge_specs(
                 "note": f"recorded room tone ({r['text']})",
             })
         else:
-            specs.append(splice_edge(ph, "initial", rows, segments))
+            specs.append(splice_edge(ph, "initial", rows, segments, sources, rate))
 
         best = None
         for r in final.get(ph, []):
@@ -666,7 +822,7 @@ def edge_specs(
                 "note": f"recorded room tone ({r['text']})",
             })
         else:
-            specs.append(splice_edge(ph, "final", rows, segments))
+            specs.append(splice_edge(ph, "final", rows, segments, sources, rate))
     return specs
 
 
@@ -734,17 +890,22 @@ def fallback_specs(
 
 
 def assemble(spec: Dict[str, object], rate: int, sources: Dict[str, Path]) -> Tuple[np.ndarray, int, int, int]:
+    pad_n = int(round(PAD * rate))
     if spec["kind"] in ("natural", "initial", "final") and "splice" not in spec:
         path = sources[str(spec["source_file"])]
         start = float(spec["source_start"])
         begin, middle, end = float(spec["begin"]), float(spec["middle"]), float(spec["end"])
-        total = sf.info(str(path)).frames / float(rate)
-        t0 = max(0.0, start + begin - PAD)
-        t1 = min(total, start + end + PAD)
-        audio = read_abs(path, rate, t0, t1)
-        first = int(round((start + begin - t0) * rate))
-        mid_i = int(round((start + middle - t0) * rate))
-        last = int(round((start + end - t0) * rate))
+        t0 = start + begin - PAD
+        t1 = start + end + PAD
+        audio = read_abs_padded(path, rate, t0, t1)
+        s0 = int(round(t0 * rate))
+        first = int(round((start + begin) * rate)) - s0
+        mid_i = int(round((start + middle) * rate)) - s0
+        last = int(round((start + end) * rate)) - s0
+        if mid_i <= first:
+            mid_i = first + 1
+        if last <= mid_i:
+            last = mid_i + 1
         if not (0 <= first < mid_i < last <= len(audio)):
             raise RuntimeError(f"{spec['label']}: bad indexes {first} {mid_i} {last} of {len(audio)}")
         return audio, first, mid_i, last
@@ -752,41 +913,60 @@ def assemble(spec: Dict[str, object], rate: int, sources: Dict[str, Path]) -> Tu
     if "splice" in spec:
         sp = spec["splice"]
         path = sources[str(sp["source"])]
+        tone_path = sources[str(sp.get("tone_source", sp["source"]))]
         half_start, half_end = float(sp["half_start"]), float(sp["half_end"])
-        tone = read_abs(path, rate, float(sp["tone_start"]), float(sp["tone_end"]))
+        tone = read_abs_padded(tone_path, rate, float(sp["tone_start"]), float(sp["tone_end"]))
+        sil_n = int(round(SILENCE_HALF * rate))
+        half_dur = max(2, int(round((half_end - half_start) * rate)))
         if sp["mode"] == "tone_then_half":
-            half = read_abs(path, rate, half_start, half_end + PAD)
-            n = min(int(XFADE * rate), max(1, len(tone) // 3), max(1, len(half) // 3))
+            half = read_abs_padded(path, rate, half_start, half_start + (half_dur + pad_n) / float(rate))
+            n = min(int(XFADE * rate), max(1, len(tone) // 3), max(1, half_dur // 3))
             audio = np.concatenate([tone[:-n], xfade(tone[-n:], half[:n], n), half[n:]])
             middle = len(tone) - n + n // 2
-            first = max(0, middle - int(round(SILENCE_HALF * rate)))
-            last = min(len(audio), len(tone) - n + int(round((half_end - half_start) * rate)))
+            first = max(0, middle - sil_n)
+            last = min(len(audio) - 1, max(middle + 1, len(tone) - n + half_dur))
         else:
-            half = read_abs(path, rate, half_start - PAD, half_end)
-            n = min(int(XFADE * rate), max(1, len(half) // 3), max(1, len(tone) // 3))
+            half = read_abs_padded(path, rate, half_start - pad_n / float(rate), half_start + half_dur / float(rate))
+            n = min(int(XFADE * rate), max(1, half_dur // 3), max(1, len(tone) // 3))
             audio = np.concatenate([half[:-n], xfade(half[-n:], tone[:n], n), tone[n:]])
-            middle = len(half) - n + n // 2
-            first = int(round(PAD * rate))
-            last = min(len(audio), middle + int(round(SILENCE_HALF * rate)))
+            first = pad_n
+            middle = max(first + 1, len(half) - n + n // 2)
+            last = min(len(audio) - 1, middle + sil_n)
         if not (0 <= first < middle < last <= len(audio)):
             raise RuntimeError(f"{spec['label']}: bad splice indexes {first} {middle} {last} of {len(audio)}")
         return audio, first, middle, last
 
     fb = spec["fallback"]
     left_mid = float(fb["left_mid"])
-    left_t0 = max(0.0, left_mid - PAD)
-    left = read_abs(sources[str(fb["left_source"])], rate, left_t0, float(fb["left_edge"]))
-    right = read_abs(sources[str(fb["right_source"])], rate, float(fb["right_start"]), float(fb["right_mid"]) + PAD)
-    n = min(int(XFADE * rate), max(1, len(left) // 3), max(1, len(right) // 3))
+    left_edge = float(fb["left_edge"])
+    right_start = float(fb["right_start"])
+    right_mid = float(fb["right_mid"])
+    left_dur = max(2, int(round((left_edge - left_mid) * rate)))
+    right_dur = max(2, int(round((right_mid - right_start) * rate)))
+    left = read_abs_padded(
+        sources[str(fb["left_source"])],
+        rate,
+        left_mid - pad_n / float(rate),
+        left_mid + left_dur / float(rate),
+    )
+    right = read_abs_padded(
+        sources[str(fb["right_source"])],
+        rate,
+        right_start,
+        right_start + (right_dur + pad_n) / float(rate),
+    )
+    n = min(int(XFADE * rate), max(1, left_dur // 3), max(1, right_dur // 3))
     if n >= 8:
         audio = np.concatenate([left[:-n], xfade(left[-n:], right[:n], n), right[n:]])
         middle = len(left) - n + n // 2
+        last = len(left) - n + right_dur
     else:
         audio = np.concatenate([left, right])
         middle = len(left)
-    first = int(round((left_mid - left_t0) * rate))
-    right_mid_idx = int(round((float(fb["right_mid"]) - float(fb["right_start"])) * rate))
-    last = min(len(audio), len(left) + right_mid_idx - (n if n >= 8 else 0))
+        last = len(left) + right_dur
+    first = pad_n
+    middle = max(first + 1, middle)
+    last = min(len(audio) - 1, max(middle + 1, last))
     if not (0 <= first < middle < last <= len(audio)):
         raise RuntimeError(f"{spec['label']}: bad fallback indexes {first} {middle} {last} of {len(audio)}")
     return audio, first, middle, last
@@ -816,20 +996,37 @@ def process_unit(job: Tuple[int, Dict[str, object]]) -> Dict[str, object]:
     period = int(_WORKER["period"])
 
     audio, first, middle, last = assemble(spec, rate, sources)
+
+    # Guarantee generous outer analysis margin so anaf0/anambe can NEVER read
+    # before sample 0 or past len(audio)-1, even after min_span expansion and retries.
+    safe_edge = 1024  # > max(f0_win=640, frame_length=960)
+    req_margin = 6 * period + safe_edge
+    pre_extra = max(0, req_margin - first)
+    post_extra = max(0, req_margin - (len(audio) - 1 - last))
+    if pre_extra > 0 or post_extra > 0:
+        audio = np.concatenate([
+            np.zeros(pre_extra, dtype=np.float32),
+            audio,
+            np.zeros(post_extra, dtype=np.float32),
+        ])
+        first += pre_extra
+        middle += pre_extra
+        last += pre_extra
+
     raw_path = build_dir / "raw" / f"{index:04d}.d16"
     pcm = np.clip(audio, -1.0, 1.0) * 32767.0
     pcm.astype("<i2").tofile(str(raw_path))
 
     # resynth.exe can segfault on ultra-short spans (< ~7 periods).
     # Ensure a safe minimum analysis span using the surrounding PAD context,
-    # and if resynth still fails, retry once with wider context.
+    # and if resynth still fails, retry with wider context while preserving safe_edge.
     min_span = 8 * period
     if (last - first) < min_span:
         need = min_span - (last - first)
         add_l = need // 2
         add_r = need - add_l
-        first = max(0, first - add_l)
-        last = min(len(audio) - 1, last + add_r)
+        first = max(safe_edge, first - add_l)
+        last = min(len(audio) - 1 - safe_edge, last + add_r)
 
     f0_path = build_dir / "ana" / f"{index}.f0"
     mbe_path = build_dir / "ana" / f"{index}.mbe"
@@ -845,8 +1042,8 @@ def process_unit(job: Tuple[int, Dict[str, object]]) -> Dict[str, object]:
             break
         except RuntimeError as exc:
             last_err = exc
-            first = max(0, first - period)
-            last = min(len(audio) - 1, last + period)
+            first = max(safe_edge, first - period)
+            last = min(len(audio) - 1 - safe_edge, last + period)
     if last_err is not None:
         raise last_err
 
@@ -967,7 +1164,79 @@ def write_espeak_voice_files(
             raise ValueError(f"phone name {s!r} exceeds 4 bytes")
         return b.ljust(4, b"\0")
 
+    # Universal fallback mappings for eSpeak NG markers, rare allophones, and
+    # English-switch loanword phonemes that may be emitted at runtime even when
+    # absent from a language's recorded canonical inventory. Only rules whose
+    # source is NOT in `canonical` and whose target(s) ARE in `canonical` are emitted.
+    universal_fallbacks: Dict[str, List[Tuple[str, ...]]] = {
+        # Silent / prosodic / glottal markers
+        ";": [()], "|": [()], "!": [()], "?": [()], "@-": [()], "*": [()], "g-": [()],
+        # Common allophones & length variants
+        "E:": [("E2",), ("E",), ("e:",), ("e",)],
+        "i:": [("i",), ("I:",), ("I",)],
+        "u:": [("u",), ("U",), ("o:",), ("o",)],
+        "a:": [("a",), ("A:",), ("A",)],
+        "A:": [("a:",), ("A",), ("a",), ("O",)],
+        "O:": [("O",), ("o:",), ("o",)],
+        "o:": [("o",), ("O:",), ("O",)],
+        "e:": [("e",), ("E:",), ("E",)],
+        "I:": [("I",), ("i:",), ("i",)],
+        "Y:": [("y",), ("8",), ("E2",), ("u",)],
+        "a": [("A",), ("a:",), ("E",)],
+        "e": [("e:",), ("E",), ("@",)],
+        "o": [("o:",), ("O",), ("O:",)],
+        "g": [("Q",), ("k",), ("x",)],
+        "tS": [("t", "S", "40"), ("S",), ("t",)],
+        "dZ": [("d", "Z", "40"), ("d", "j", "50"), ("Z",), ("d",)],
+        "t;": [("t", "j", "50"), ("t",)],
+        "d;": [("d", "j", "50"), ("d",)],
+        "c": [("t", "j", "50"), ("k",)],
+        "J": [("d", "j", "50"), ("j",)],
+        "s;": [("S",), ("s",)],
+        "C": [("x",), ("S",), ("h",)],
+        "l/": [("l",)], "l/2": [("l",)], "l-": [("l",)], "L": [("l",)],
+        "r/": [("r",)], "r-": [("r",)], "R": [("r",)],
+        "w/": [("w",), ("v#",), ("v",)],
+        "j/": [("j",)],
+        "n^": [("n", "j", "50"), ("n",)],
+        "v#": [("w",), ("v",)],
+        # English-switch loanword vowels & consonants
+        "eI": [("EI",), ("e:",), ("e", "i", "60"), ("E", "i", "60"), ("E",)],
+        "aI": [("A", "i", "60"), ("A", "j", "60"), ("a", "i", "60"), ("a", "j", "60"), ("EI",)],
+        "OI": [("O", "i", "60"), ("O", "j", "60"), ("o:", "j", "60"), ("O",)],
+        "aU": [("VU",), ("A", "u", "60"), ("a", "u", "60"), ("O",)],
+        "oU": [("o:",), ("o", "u", "60"), ("o",), ("O",)],
+        "i@": [("i", "@", "60"), ("I:",), ("i",)],
+        "e@": [("E", "@", "60"), ("E2",), ("E",)],
+        "u@": [("u", "@", "60"), ("u",)],
+        "U@": [("u", "@", "60"), ("u",)],
+        "o@": [("O:",), ("o:",), ("O",)],
+        "O@": [("O:",), ("o:",), ("O",)],
+        "A@": [("a:",), ("A",), ("a",)],
+        "aI@": [("a:", "@", "70"), ("A", "@", "70"), ("a", "@", "70")],
+        "aU@": [("VU", "@", "70"), ("A", "@", "70"), ("a", "@", "70")],
+        "@L": [("@", "l", "50"), ("l",)],
+        "@2": [("@",), ("E",)],
+        "@5": [("@",), ("E",)],
+        "3": [("@",), ("8",), ("E",)],
+        "3:": [("Y:",), ("E2",), ("@",), ("e:",), ("E",)],
+        "a#": [("@",), ("a",), ("A",)],
+        "V": [("8",), ("@",), ("A",), ("a",)],
+        "I2": [("I",), ("i",)],
+        "U": [("u",), ("O",), ("o",)],
+        "0": [("O",), ("o",), ("A",)],
+        "aa": [("a:",), ("A",), ("a",)],
+        "T": [("t",), ("s",), ("f",)],
+        "D": [("d",), ("z",), ("v",)],
+        # French/loanword nasal vowels
+        "E~": [("E", "N", "65"), ("E", "n", "65"), ("E",)],
+        "A~": [("A", "N", "65"), ("A", "n", "65"), ("A",)],
+        "O~": [("O", "N", "65"), ("O", "n", "65"), ("O",)],
+        "9~": [("8", "N", "65"), ("@", "n", "65"), ("@",)],
+    }
+
     records = []
+    seen_src = set()
     for src, targets in sorted(norm.items()):
         if src in canonical:
             continue
@@ -983,6 +1252,26 @@ def write_espeak_voice_files(
         out2 = targets[1] if len(targets) == 2 else ""
         pct = splits.get(src, 0) if len(targets) == 2 else 0
         records.append((src, "", out1, out2, pct, 0))
+        seen_src.add(src)
+
+    for src, options in universal_fallbacks.items():
+        if src in canonical or src in seen_src:
+            continue
+        if len(src.encode("ascii", errors="ignore")) != len(src) or len(src) > 4:
+            continue
+        for opt in options:
+            if len(opt) == 0:
+                records.append((src, "", "", "", 0, 0))
+                seen_src.add(src)
+                break
+            if len(opt) == 1 and opt[0] in canonical:
+                records.append((src, "", opt[0], "", 0, 0))
+                seen_src.add(src)
+                break
+            if len(opt) == 3 and opt[0] in canonical and opt[1] in canonical:
+                records.append((src, "", opt[0], opt[1], int(opt[2]), 0))
+                seen_src.add(src)
+                break
 
     # Build binary phtrans (header=20 -> 1.25 gain calibrated to volume 0.8)
     buf = bytearray(struct.pack("<I", 20))
@@ -1105,7 +1394,7 @@ def main() -> int:
 
     sources = prepare_sources(args.rate, build_dir, args.audio_dir, segments)
     naturals = [natural_spec(lbl, r, segments[int(r["line"])]) for lbl, r in sorted(chosen.items())]
-    edges = edge_specs(phones, rows, segments, sources, args.rate)
+    edges = edge_specs(phones, rows, segments, sources, args.rate, build_dir)
     fallbacks = fallback_specs(phones, rows, segments, chosen, dist_fn)
     specs = naturals + edges + fallbacks
     print(f"Matrix units: {len(naturals)} recorded + {len(edges)} edges + {len(fallbacks)} cross-spliced = {len(specs)} total", flush=True)
@@ -1136,6 +1425,8 @@ def main() -> int:
     if failures:
         (out_root / "build_failures.txt").write_text("\n".join(failures) + "\n", encoding="utf-8")
         print(f"WARNING: {len(failures)} unit failures (see build_failures.txt)", file=sys.stderr)
+    if not results:
+        raise RuntimeError("All diphone units failed analysis; see build_failures.txt")
 
     # 5. Pad, gain-scale (using p99 peak so 1-2 isolated plosive spikes cannot drag down
     # the entire voice bank's loudness, while capping rare outliers cleanly below clip), pack database
@@ -1149,6 +1440,19 @@ def main() -> int:
     gain = RESYNTH_GAIN if ref_peak == 0 else min(RESYNTH_GAIN, MAX_PEAK_FRACTION * 32767.0 / ref_peak)
     capped_units = scale_outputs(s16_paths, gain)
     print(f"Gain={gain:.3f} (p99_peak={p99_peak}, max_peak={max_peak}, headroom_capped={capped_units})", flush=True)
+
+    # database_build.exe reads res/0.s16 .. res/(N-1).s16 by contiguous 0-based .seg line index.
+    # If any unit failed, copy surviving .s16/.pm contiguously into res_packed/ so packing cannot
+    # crash with "FATAL ERROR input files res/<gap>.s16 !".
+    res_arg = "res/"
+    if failures:
+        pack_dir = build_dir / "res_packed"
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        for new_idx, item in enumerate(results):
+            old_idx = int(item["index"])
+            shutil.copy2(build_dir / "res" / f"{old_idx}.s16", pack_dir / f"{new_idx}.s16")
+            shutil.copy2(build_dir / "res" / f"{old_idx}.pm", pack_dir / f"{new_idx}.pm")
+        res_arg = "res_packed/"
 
     seg_lines = []
     manifest = []
@@ -1168,7 +1472,7 @@ def main() -> int:
 
     print("Packing database with database_build.exe...", flush=True)
     res_pack = run(
-        [DATABASE_BUILD, args.name, "res/", "res/", DATABASE_VERSION, args.rate, period, DATABASE_CODING, DATABASE_VOLUME],
+        [DATABASE_BUILD, args.name, res_arg, res_arg, DATABASE_VERSION, args.rate, period, DATABASE_CODING, DATABASE_VOLUME],
         cwd=build_dir,
     )
     (build_dir / "database_build.log").write_text(res_pack.stdout + res_pack.stderr, encoding="utf-8")
