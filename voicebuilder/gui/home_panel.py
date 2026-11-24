@@ -199,13 +199,12 @@ class HomePanel(wx.Panel):
         proj_sizer.Add(btn_row, 0, wx.ALL, 6)
 
         lbl_recent = wx.StaticText(self, label="&Recent Projects (press Enter or double-click to open):")
-        self.list_recent = wx.ListBox(self, style=wx.LB_SINGLE | wx.WANTS_CHARS)
+        self.list_recent = wx.ListBox(self, style=wx.LB_SINGLE)
         self.list_recent.SetName("Recent Projects")
         self.list_recent.SetMinSize((-1, 80))
         self.list_recent.Bind(wx.EVT_LISTBOX_DCLICK, self._on_open_recent)
         self.list_recent.Bind(wx.EVT_LISTBOX, self._on_recent_selection_changed)
         self.list_recent.Bind(wx.EVT_CHAR_HOOK, self._on_recent_key)
-        self.list_recent.Bind(wx.EVT_KEY_DOWN, self._on_recent_key)
         proj_sizer.Add(lbl_recent, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
         proj_sizer.Add(self.list_recent, 0, wx.EXPAND | wx.ALL, 6)
 

@@ -40,6 +40,13 @@ def phrase_to_diphones(phrase: str, voice: str, inventory: Optional[Dict[str, ob
     espeak_bin, espeak_data = get_espeak_paths()
     env = os.environ.copy()
     env["ESPEAK_DATA_PATH"] = str(espeak_data.resolve())
+    hidden_kw = {}
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        hidden_kw["startupinfo"] = si
+        hidden_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     res = subprocess.run(
         [str(espeak_bin), "-v", voice, "-q", "-x", "--sep=_", phrase],
         capture_output=True,
@@ -48,6 +55,7 @@ def phrase_to_diphones(phrase: str, voice: str, inventory: Optional[Dict[str, ob
         errors="replace",
         env=env,
         check=True,
+        **hidden_kw,
     )
     raw_words = [w for w in res.stdout.strip().split() if w]
     v_set_pre, c_set_pre, norm_map = P.get_normalization(voice, "auto")

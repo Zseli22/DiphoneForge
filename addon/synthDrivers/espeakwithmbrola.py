@@ -64,13 +64,37 @@ class SynthDriver(SynthDriver):
 		lang=languageHandler.getLanguage()
 		try:
 			_espeak_mb.setVoiceByLanguage(lang)
-			self._language=lang
 		except RuntimeError:
 			_espeak_mb.setVoiceByLanguage('en')
-			self._language= 'en'
+		cur = _espeak_mb.getCurrentVoice()
+		avail = self.availableVoices
+		defaultVoice = self._fallbackVoiceId(avail)
+		curId = self._normalizeVoiceId(_espeak_mb.decodeEspeakString(cur.identifier)) if cur else ""
+		if curId in avail:
+			self._voice = curId
+			self._language = avail[curId].language or lang or 'en'
+		elif defaultVoice:
+			self._set_voice(defaultVoice)
+		else:
+			self._voice = curId or None
+			self._language = lang or 'en'
 		self.rate=30
 		self.pitch=50
 		self.inflection=50
+
+	@staticmethod
+	def _normalizeVoiceId(identifier: str) -> str:
+		ident = os.path.basename(str(identifier or "").replace("\\", "/")).split('+')[0].lower()
+		# Configurations saved before 3.0 may still name the classic descriptors.
+		return {"usd16": "mb-usd16", "usd": "mb-usd"}.get(ident, ident)
+
+	@staticmethod
+	def _fallbackVoiceId(avail) -> Optional[str]:
+		if not avail:
+			return None
+		if "mb-usd16" in avail:
+			return "mb-usd16"
+		return next(iter(avail))
 
 	def _get_language(self):
 		return self._language
@@ -234,30 +258,44 @@ class SynthDriver(SynthDriver):
 		return voices
 
 	def _get_voice(self):
+		avail=self.availableVoices
 		curVoice=getattr(self,'_voice',None)
-		if curVoice: return curVoice
-		curVoice = _espeak_mb.getCurrentVoice()
-		if not curVoice:
-			return ""
-		# #5783: For backwards compatibility, voice identifies should always be lowercase
-		return _espeak_mb.decodeEspeakString(curVoice.identifier).split('+')[0].lower()
+		if curVoice and (not avail or curVoice in avail):
+			return curVoice
+		cur = _espeak_mb.getCurrentVoice()
+		if cur:
+			ident = self._normalizeVoiceId(_espeak_mb.decodeEspeakString(cur.identifier))
+			if not avail or ident in avail:
+				return ident
+		return self._fallbackVoiceId(avail) or ""
 
 	def _set_voice(self, identifier):
 		if not identifier:
 			return
-		# #5783: For backwards compatibility, voice identifies should always be lowercase
-		identifier=identifier.lower()
-		# Configurations saved before 3.0 may still name the classic descriptors.
-		identifier={"usd16": "mb-usd16", "usd": "mb-usd"}.get(identifier, identifier)
-		if "\\" in identifier:
-			identifier=os.path.basename(identifier)
+		# #5783: For backwards compatibility, voice identifiers should always be lowercase
+		identifier=self._normalizeVoiceId(identifier)
+		avail=self.availableVoices
+		if avail and identifier not in avail:
+			fallback=self._fallbackVoiceId(avail)
+			log.warning(
+				"eSpeak with MBROLA: voice %r is not installed; falling back to %r"
+				% (identifier, fallback)
+			)
+			identifier=fallback
 		self._voice=identifier
 		try:
 			_espeak_mb.setVoiceAndVariant(voice=identifier,variant="NONE")
 		except:
 			self._voice=None
 			raise
-		self._language=super(SynthDriver,self).language
+		voiceInfo=avail.get(identifier)
+		if voiceInfo is not None and voiceInfo.language:
+			self._language=voiceInfo.language
+		else:
+			try:
+				self._language=super(SynthDriver,self).language
+			except KeyError:
+				self._language="en"
 
 	def _onIndexReached(self, index):
 		if index is not None:

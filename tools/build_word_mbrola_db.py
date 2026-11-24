@@ -118,7 +118,20 @@ IPA_CONS_BASE = {
 
 
 def run(cmd: Sequence[object], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
-    res = subprocess.run([str(c) for c in cmd], cwd=str(cwd) if cwd else None, capture_output=True, text=True)
+    hidden_kw: Dict[str, object] = {}
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        hidden_kw["startupinfo"] = si
+        hidden_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    res = subprocess.run(
+        [str(c) for c in cmd],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        **hidden_kw,
+    )
     if res.returncode != 0:
         raise RuntimeError(
             f"command failed ({res.returncode}): {' '.join(str(c) for c in cmd)}\n"

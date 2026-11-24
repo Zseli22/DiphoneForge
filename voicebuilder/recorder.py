@@ -179,8 +179,9 @@ class TakeRecorder:
         with self._lock:
             return self._recording
 
-    def start(self, device: Optional[int] = None) -> None:
-        stop_playback()
+    def start(self, device: Optional[int] = None, *, stop_audio: bool = True) -> None:
+        if stop_audio:
+            stop_playback()
         with self._lock:
             if self._recording:
                 return
@@ -202,6 +203,43 @@ class TakeRecorder:
         stream.start()
         with self._lock:
             self._stream = stream
+
+    def clear_buffer(self) -> None:
+        """Discard buffered audio for the current line while keeping the input stream open."""
+        with self._lock:
+            self._chunks = []
+
+    def _write_chunks(
+        self,
+        chunks: List[np.ndarray],
+        dest_wav: Path,
+        *,
+        calibrated_noise_db: Optional[float] = None,
+    ) -> TakeQuality:
+        if chunks:
+            audio = np.concatenate(chunks, axis=0)
+            if audio.ndim > 1:
+                audio = audio[:, 0]
+        else:
+            audio = np.zeros(0, dtype=np.float32)
+
+        dest_wav.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest_wav.with_suffix(".wav.tmp")
+        sf.write(str(tmp), audio, self.sample_rate, subtype="PCM_16", format="WAV")
+        tmp.replace(dest_wav)
+        return analyze_take(audio, self.sample_rate, calibrated_noise_db=calibrated_noise_db)
+
+    def flush_and_save_keep_recording(
+        self,
+        dest_wav: Path,
+        *,
+        calibrated_noise_db: Optional[float] = None,
+    ) -> TakeQuality:
+        """Save the current take atomically and immediately roll into a fresh buffer without closing the mic."""
+        with self._lock:
+            chunks = list(self._chunks)
+            self._chunks = []
+        return self._write_chunks(chunks, dest_wav, calibrated_noise_db=calibrated_noise_db)
 
     def abort(self) -> None:
         """Force-stop an in-progress recording without saving (e.g. at transition gates)."""
@@ -236,16 +274,4 @@ class TakeRecorder:
                 stream.close()
             except Exception:
                 pass
-
-        if chunks:
-            audio = np.concatenate(chunks, axis=0)
-            if audio.ndim > 1:
-                audio = audio[:, 0]
-        else:
-            audio = np.zeros(0, dtype=np.float32)
-
-        dest_wav.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest_wav.with_suffix(".wav.tmp")
-        sf.write(str(tmp), audio, self.sample_rate, subtype="PCM_16", format="WAV")
-        tmp.replace(dest_wav)
-        return analyze_take(audio, self.sample_rate, calibrated_noise_db=calibrated_noise_db)
+        return self._write_chunks(chunks, dest_wav, calibrated_noise_db=calibrated_noise_db)

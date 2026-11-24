@@ -539,21 +539,48 @@ def getCurrentVoice():
 	return _currentVoice
 
 
+def _voiceIdBase(identifier):
+	return os.path.basename(decodeEspeakString(identifier).replace("\\", "/")).split("+")[0].lower()
+
+
 def setVoiceByLanguage(language):
+	"""Select an installed MBROLA voice matching `language`, falling back to mb-usd16 or first installed."""
 	global _currentVoice
-	language = str(language or "en").replace("_", "-")
-	voiceId = _host.setLanguage(language)
-	_currentVoice = next((voice for voice in _voices if voice.identifier.decode("utf-8") == voiceId), None)
-	if _currentVoice is None:
-		_currentVoice = next((voice for voice in _voices if voice.identifier.decode("utf-8") == "mb-en1"), None)
+	lang = str(language or "en").replace("_", "-").lower()
+	baseLang = lang.split("-")[0]
+	mbVoices = getMbrolaVoiceList()
+	if not mbVoices:
+		# Fallback if no MBROLA databases are present at all
+		voiceId = _host.setLanguage(lang)
+		_currentVoice = next((voice for voice in _voices if _voiceIdBase(voice.identifier) == _voiceIdBase(voiceId)), None)
+		return
+
+	chosen = None
+	# 1. Exact language match (preferring mb-usd16 for English if tied)
+	exact = [v for v in mbVoices if decodeEspeakString(v.languages[1:]).lower() == lang]
+	if exact:
+		chosen = next((v for v in exact if _voiceIdBase(v.identifier) == "mb-usd16"), exact[0])
+	# 2. Base language match (e.g. 'en' or 'en-gb' matching 'en-us')
+	if chosen is None:
+		baseMatches = [v for v in mbVoices if decodeEspeakString(v.languages[1:]).lower().split("-")[0] == baseLang]
+		if baseMatches:
+			chosen = next((v for v in baseMatches if _voiceIdBase(v.identifier) == "mb-usd16"), baseMatches[0])
+	# 3. Default to shipped mb-usd16, or first installed MBROLA voice
+	if chosen is None:
+		chosen = next((v for v in mbVoices if _voiceIdBase(v.identifier) == "mb-usd16"), mbVoices[0])
+
+	setVoiceByName(_voiceIdBase(chosen.identifier))
 
 
 def setVoiceByName(name):
 	global _currentVoice
-	voiceId = _host.setVoice(decodeEspeakString(name))
-	_currentVoice = next((voice for voice in _voices if voice.identifier.decode("utf-8") == voiceId), None)
+	cleanName = decodeEspeakString(name)
+	voiceId = _host.setVoice(cleanName)
+	target = _voiceIdBase(voiceId)
+	_currentVoice = next((voice for voice in _voices if _voiceIdBase(voice.identifier) == target), None)
 	if _currentVoice is None:
-		_currentVoice = next((voice for voice in _voices if voice.identifier.decode("utf-8") == decodeEspeakString(name)), None)
+		fallbackTarget = _voiceIdBase(cleanName)
+		_currentVoice = next((voice for voice in _voices if _voiceIdBase(voice.identifier) == fallbackTarget), None)
 
 
 def setVoice(voice):

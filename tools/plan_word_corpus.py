@@ -292,6 +292,13 @@ def batch_phonemize(
 ) -> Tuple[List[str], List[str]]:
     env = os.environ.copy()
     env["ESPEAK_DATA_PATH"] = str(espeak_data.resolve())
+    hidden_kw: Dict[str, object] = {}
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        hidden_kw["startupinfo"] = si
+        hidden_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     x_lines: List[str] = []
     ipa_lines: List[str] = []
     for i in range(0, len(words), chunk_size):
@@ -302,6 +309,7 @@ def batch_phonemize(
             capture_output=True,
             env=env,
             check=True,
+            **hidden_kw,
         )
         ri = subprocess.run(
             [str(espeak_bin), "-v", voice, "-q", "--ipa", "--sep=_"],
@@ -309,6 +317,7 @@ def batch_phonemize(
             capture_output=True,
             env=env,
             check=True,
+            **hidden_kw,
         )
         x_lines.extend(rx.stdout.decode("utf-8", "replace").splitlines())
         ipa_lines.extend(ri.stdout.decode("utf-8", "replace").splitlines())

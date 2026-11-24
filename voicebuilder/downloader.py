@@ -399,6 +399,7 @@ def inspect_mfa_model_phones(
             "acoustic",
             model_name,
         ]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         res = subprocess.run(
             cmd,
             capture_output=True,
@@ -406,6 +407,7 @@ def inspect_mfa_model_phones(
             encoding="utf-8",
             errors="replace",
             env=mfa_subprocess_env(env_dir),
+            creationflags=creationflags,
             check=True,
         )
         # Parse phone list from YAML/text inspect output
