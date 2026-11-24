@@ -1102,22 +1102,36 @@ def scale_outputs(paths: Iterable[Path], base_gain: float, peak_limit: float = M
     return capped
 
 
-def validate_db(db_path: Path, manifest: List[Dict[str, object]], out_dir: Path) -> List[Dict[str, object]]:
+def validate_db(
+    db_path: Path,
+    manifest: List[Dict[str, object]],
+    out_dir: Path,
+    f0_hz: float = 120.0,
+) -> List[Dict[str, object]]:
     test_dir = out_dir / "tests"
     test_dir.mkdir(parents=True, exist_ok=True)
-    labels = [str(m["label"]) for m in manifest]
+    pitch = max(60, min(350, int(round(f0_hz))))
     results: List[Dict[str, object]] = []
     chunk_size = 300
     for off in range(0, len(manifest), chunk_size):
         chunk = manifest[off:off + chunk_size]
-        pho_lines = []
+        # Never emit back-to-back '_' pauses and always attach a pitch anchor to
+        # every non-pause phone so mbrola.exe's 256-phone PhoneBuff never overflows
+        # or segfaults (0xC0000005) on large chunks spanning edge (_X / X_) units.
+        pho_lines: List[str] = ["_ 60"]
+
+        def _append_pause() -> None:
+            if not pho_lines or not pho_lines[-1].startswith("_ "):
+                pho_lines.append("_ 60")
+
         for m in chunk:
             left, right = str(m["left"]), str(m["right"])
+            _append_pause()
             if left != "_":
-                pho_lines.append("_ 60")
-            pho_lines.append(f"{left} 80" if left != "_" else "_ 60")
-            pho_lines.append(f"{right} 80" if right != "_" else "_ 60")
-        pho_lines.append("_ 60")
+                pho_lines.append(f"{left} 80 50 {pitch}")
+            if right != "_":
+                pho_lines.append(f"{right} 80 50 {pitch}")
+            _append_pause()
         pho = test_dir / f"coverage_{off // chunk_size:02d}.pho"
         wav = pho.with_suffix(".wav")
         pho.write_text("\n".join(pho_lines) + "\n", encoding="ascii")
@@ -1483,7 +1497,7 @@ def main() -> int:
 
     # 6. Validate all units through mbrola.exe
     print("Validating all units through mbrola.exe...", flush=True)
-    val_results = validate_db(db_path, manifest, out_root)
+    val_results = validate_db(db_path, manifest, out_root, f0_hz=f0_stats["median_hz"])
 
     # 7. Write faithful eSpeak phtrans & descriptor
     phtrans_name = args.phtrans_name or f"{args.name}_phtrans"
