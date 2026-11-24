@@ -230,7 +230,9 @@ def ensure_mfa_env(
     mm = ensure_micromamba(progress=progress, cancel=cancel)
     target = get_default_mfa_env_dir()
     target.parent.mkdir(parents=True, exist_ok=True)
-    _report(progress, f"Creating MFA environment in {target} (one-time ~2.4 GB download)...", None)
+    mamba_root = get_cache_root() / "mamba_root"
+    mamba_root.mkdir(parents=True, exist_ok=True)
+    _report(progress, f"Creating MFA environment in {target} (one-time ~415 MB download)...", 0.05)
 
     cmd = [
         str(mm),
@@ -240,11 +242,18 @@ def ensure_mfa_env(
         str(target),
         "-c",
         "conda-forge",
+        "--override-channels",
         "montreal-forced-aligner>=3.1",
-        "soundfile",
-        "scipy",
     ]
+    env = os.environ.copy()
+    env["MAMBA_ROOT_PREFIX"] = str(mamba_root)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    hidden_kw = {}
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        hidden_kw["startupinfo"] = si
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -252,9 +261,12 @@ def ensure_mfa_env(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
         creationflags=creationflags,
+        **hidden_kw,
     )
     tail: List[str] = []
+    cur_frac = 0.05
     assert proc.stdout is not None
     try:
         for line in proc.stdout:
@@ -264,7 +276,20 @@ def ensure_mfa_env(
                 tail.append(s)
                 if len(tail) > 40:
                     tail.pop(0)
-                _report(progress, f"MFA setup: {s[:110]}", None)
+                low = s.lower()
+                if "fetching" in low or "fetch shard" in low:
+                    cur_frac = max(cur_frac, 0.12)
+                elif "resolving" in low:
+                    cur_frac = max(cur_frac, 0.22)
+                elif "downloading" in low:
+                    cur_frac = max(cur_frac, 0.35)
+                elif "extracting" in low:
+                    cur_frac = max(cur_frac, 0.65)
+                elif "linking" in low or "transaction starting" in low:
+                    cur_frac = max(cur_frac, 0.80)
+                elif "transaction finished" in low:
+                    cur_frac = max(cur_frac, 0.96)
+                _report(progress, f"MFA setup: {s[:110]}", cur_frac)
         rc = proc.wait()
     except BaseException:
         proc.terminate()
