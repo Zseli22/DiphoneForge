@@ -192,4 +192,6 @@ def mfa_subprocess_env(mfa_env_dir: Path) -> Dict[str, str]:
     env["PATH"] = prepend + os.pathsep + env.get("PATH", "")
     env["CONDA_PREFIX"] = str(env_dir)
     env["MFA_ROOT_DIR"] = str(mfa_root_safe)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     return env

@@ -397,19 +397,54 @@ def inspect_mfa_model_phones(
         if data.get("phones"):
             return list(data["phones"])
 
-    # Fast path: MFA acoustic model zips store meta.json directly inside the archive!
+    # Fast path: MFA acoustic model zips store meta.json (v3 *_mfa) or meta.yaml (v2 *_cv)
+    # directly inside the archive — parse either without spawning MFA!
+    import ast
     import zipfile
+
+    def _decode_yaml_scalar(raw: str) -> str:
+        s = raw.strip()
+        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            try:
+                return str(ast.literal_eval(s))
+            except Exception:
+                return s[1:-1]
+        if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
+            return s[1:-1].replace("''", "'")
+        return s
 
     phones: List[str] = []
     try:
         with zipfile.ZipFile(model_zip, "r") as zf:
-            for name in zf.namelist():
+            names = zf.namelist()
+            for name in names:
                 if name.endswith("meta.json"):
                     meta = json.loads(zf.read(name).decode("utf-8"))
                     raw_phones = meta.get("phones") or []
                     if isinstance(raw_phones, list) and raw_phones:
                         phones = [str(p) for p in raw_phones]
                         break
+            if not phones:
+                for name in names:
+                    if name.endswith("meta.yaml") or name.endswith("meta.yml"):
+                        text = zf.read(name).decode("utf-8", errors="replace")
+                        in_phones = False
+                        for ln in text.splitlines():
+                            if re.match(r"^\s*phones\s*:", ln):
+                                inline = re.search(r"\[([^\]]+)\]", ln)
+                                if inline:
+                                    phones = [_decode_yaml_scalar(t) for t in inline.group(1).split(",") if t.strip()]
+                                    break
+                                in_phones = True
+                                continue
+                            if in_phones:
+                                mm = re.match(r"^\s*-\s+(.+?)\s*$", ln)
+                                if mm:
+                                    phones.append(_decode_yaml_scalar(mm.group(1)))
+                                elif ln.strip() and not ln.startswith(" "):
+                                    break
+                        if phones:
+                            break
     except Exception:
         phones = []
 
