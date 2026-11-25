@@ -164,6 +164,40 @@ def stop_playback() -> None:
         pass
 
 
+def play_warning_tone(*, blocking: bool = True) -> None:
+    """Play a brief, non-speech two-tone descending cue (~200 ms) signaling a failed take."""
+    sr = RECORD_SAMPLE_RATE
+
+    def _tone(freq_hz: float, dur_s: float, amp: float = 0.28) -> np.ndarray:
+        n = max(1, int(round(dur_s * sr)))
+        t = np.arange(n, dtype=np.float32) / float(sr)
+        wave = np.sin(2.0 * math.pi * freq_hz * t) * amp
+        fade = min(int(0.008 * sr), n // 4)
+        if fade > 1:
+            env = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            wave[:fade] *= env
+            wave[-fade:] *= env[::-1]
+        return wave
+
+    gap = np.zeros(int(0.025 * sr), dtype=np.float32)
+    cue = np.concatenate([_tone(360.0, 0.075), gap, _tone(240.0, 0.105)])
+    try:
+        sd.stop()
+        sd.play(cue, sr, blocking=blocking)
+    except Exception:
+        pass
+
+
+def save_take_wav(audio: np.ndarray, dest_wav: Path, sample_rate: int = RECORD_SAMPLE_RATE) -> None:
+    """Atomically write a mono 16-bit PCM WAV take."""
+    mono = audio[:, 0] if audio.ndim > 1 else audio
+    mono = np.asarray(mono, dtype=np.float32)
+    dest_wav.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest_wav.with_suffix(".wav.tmp")
+    sf.write(str(tmp), mono, sample_rate, subtype="PCM_16", format="WAV")
+    tmp.replace(dest_wav)
+
+
 class TakeRecorder:
     """Non-blocking toggle recorder (`start()` -> `stop_and_save(dest_wav)`)."""
 
@@ -209,6 +243,14 @@ class TakeRecorder:
         with self._lock:
             self._chunks = []
 
+    def _chunks_to_mono(self, chunks: List[np.ndarray]) -> np.ndarray:
+        if chunks:
+            audio = np.concatenate(chunks, axis=0)
+            if audio.ndim > 1:
+                audio = audio[:, 0]
+            return np.asarray(audio, dtype=np.float32)
+        return np.zeros(0, dtype=np.float32)
+
     def _write_chunks(
         self,
         chunks: List[np.ndarray],
@@ -216,18 +258,32 @@ class TakeRecorder:
         *,
         calibrated_noise_db: Optional[float] = None,
     ) -> TakeQuality:
-        if chunks:
-            audio = np.concatenate(chunks, axis=0)
-            if audio.ndim > 1:
-                audio = audio[:, 0]
-        else:
-            audio = np.zeros(0, dtype=np.float32)
-
-        dest_wav.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest_wav.with_suffix(".wav.tmp")
-        sf.write(str(tmp), audio, self.sample_rate, subtype="PCM_16", format="WAV")
-        tmp.replace(dest_wav)
+        audio = self._chunks_to_mono(chunks)
+        save_take_wav(audio, dest_wav, self.sample_rate)
         return analyze_take(audio, self.sample_rate, calibrated_noise_db=calibrated_noise_db)
+
+    def flush_buffer(self) -> np.ndarray:
+        """Atomically extract and clear the buffered audio while keeping the mic stream open."""
+        with self._lock:
+            chunks = list(self._chunks)
+            self._chunks = []
+        return self._chunks_to_mono(chunks)
+
+    def stop_buffer(self) -> np.ndarray:
+        """Stop and close the mic stream, returning the buffered mono float32 audio."""
+        with self._lock:
+            self._recording = False
+            stream = self._stream
+            self._stream = None
+            chunks = list(self._chunks)
+            self._chunks = []
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        return self._chunks_to_mono(chunks)
 
     def flush_and_save_keep_recording(
         self,

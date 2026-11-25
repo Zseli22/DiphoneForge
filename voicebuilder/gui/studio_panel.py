@@ -1,14 +1,22 @@
 """Screen 2 — Dual-Mode Audio Studio (Built-in PC Mic Studio + External Recorder Import).
 
 Built-in Mic Studio UX invariants:
-  - Space toggles recording Start / Stop (when not focused inside an editable text field).
-  - P plays the eSpeak pronunciation reference on demand for real words.
+  - No read-only prompt edit box and no automatic focus jumping (keeps NVDA silent during recording).
+  - Auto-speaks every prompt with eSpeak (default ON) on Start Recording (in headphone mode),
+    Accept (A), Retake (R), Previous, Skip, and Prompt List jumps.
+  - Bare single-key workflow from any Studio button/checkbox:
+      * Space (on Start/Stop Recording) / F5 / Ctrl+Space: Start or Stop recording.
+      * A: Accept take & advance (keeps mic rolling in Continuous headphone mode).
+           If a take clips, is too quiet, too short, or has severe low SNR, stays on the
+           same prompt, plays a brief descending warning tone, and replays the word.
+      * R: Retake (clears buffer & keeps rolling in Continuous mode; replays the word).
+      * P: Replay eSpeak pronunciation reference on demand.
+      * L: Listen back to the saved take.
   - Real-words -> Nonsense-supplements transition gate:
       * Force-stops any active recording cleanly.
       * Alerts the speaker via an accessible dialog that the remaining prompts are
         nonsense sounds and they should listen carefully.
-      * Immediately auto-plays the eSpeak audio reference on every nonsense supplement line!
-  - Instant post-take quality check (clipping, quiet, too short, SNR) reported clearly.
+      * Auto-plays the eSpeak audio reference on every nonsense supplement line.
 """
 
 from __future__ import annotations
@@ -24,10 +32,13 @@ import wx
 from ..aligner import read_ranges_file, validate_external_ranges, write_ranges_file
 from ..recorder import (
     TakeRecorder,
+    analyze_take,
     calibrate_room_noise,
     default_input_device_index,
     list_input_devices,
+    play_warning_tone,
     play_wav_file,
+    save_take_wav,
     stop_playback,
 )
 from ..reference import export_reference_wavs, play_prompt_reference
@@ -99,7 +110,7 @@ class StudioPanel(wx.Panel):
         dev_row.Add(self.btn_mic_check, 0)
         s.Add(dev_row, 0, wx.EXPAND | wx.BOTTOM, 8)
 
-        # Filter, headphone mode & progress row
+        # Filter, headphone mode, auto-speak & progress row
         flt_row = wx.BoxSizer(wx.HORIZONTAL)
         lbl_flt = wx.StaticText(p, label="Show Pr&ompts:")
         self.choice_filter = wx.Choice(p, choices=["All Prompts", "Unrecorded Only", "Flagged from Audit"])
@@ -109,50 +120,67 @@ class StudioPanel(wx.Panel):
         self.chk_continuous = wx.CheckBox(p, label="Contin&uous recording (headphones)")
         self.chk_continuous.SetName("Continuous recording with headphones")
         self.chk_continuous.SetToolTip(
-            "Keep the microphone rolling across prompts when pressing Enter and while listening to "
-            "pronunciation references (P) on headphones."
+            "Keep the microphone rolling across prompts when pressing A (accept) or R (retake) "
+            "while listening to eSpeak prompts on headphones."
+        )
+        self.chk_auto_speak = wx.CheckBox(p, label="Auto-sp&eak prompts with eSpeak")
+        self.chk_auto_speak.SetName("Auto-speak prompts with eSpeak")
+        self.chk_auto_speak.SetValue(True)
+        self.chk_auto_speak.SetToolTip(
+            "Automatically speak each prompt with eSpeak on Start Recording (continuous mode), "
+            "Accept (A), Retake (R), Previous, and Skip without needing to press P."
         )
         self.lbl_progress = wx.StaticText(p, label="Recorded: 0 / 0")
         flt_row.Add(lbl_flt, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         flt_row.Add(self.choice_filter, 0, wx.RIGHT, 12)
         flt_row.Add(self.chk_continuous, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
+        flt_row.Add(self.chk_auto_speak, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
         flt_row.Add(self.lbl_progress, 1, wx.ALIGN_CENTER_VERTICAL)
         s.Add(flt_row, 0, wx.EXPAND | wx.BOTTOM, 8)
 
-        # Current prompt display box
-        prompt_box = wx.StaticBox(p, label="Current Prompt (Shortcuts: Space = Record/Stop, P = Play Ref, L = Listen, Enter = Next, R = Retake)")
+        # Current prompt display box (non-focusable visual text so NVDA stays silent while recording)
+        prompt_box = wx.StaticBox(p, label="Current Prompt")
         ps = wx.StaticBoxSizer(prompt_box, wx.VERTICAL)
 
         self.lbl_prompt_header = wx.StaticText(p, label="Line 0 / 0")
         self.lbl_prompt_header.SetFont(self.lbl_prompt_header.GetFont().Bold())
         ps.Add(self.lbl_prompt_header, 0, wx.ALL, 6)
 
-        self.txt_prompt = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_CENTER)
-        self.txt_prompt.SetName("Current Prompt Word")
-        self.txt_prompt.SetFont(self.txt_prompt.GetFont().Bold().Scaled(2.0))
-        self.txt_prompt.SetMinSize((-1, 56))
-        ps.Add(self.txt_prompt, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        self.lbl_prompt_word = wx.StaticText(p, label="", style=wx.ALIGN_CENTRE_HORIZONTAL | wx.ST_NO_AUTORESIZE)
+        self.lbl_prompt_word.SetFont(self.lbl_prompt_word.GetFont().Bold().Scaled(2.0))
+        self.lbl_prompt_word.SetMinSize((-1, 52))
+        ps.Add(self.lbl_prompt_word, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
         self.lbl_prompt_ipa = wx.StaticText(p, label="")
         ps.Add(self.lbl_prompt_ipa, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
         # Action buttons
         act_row = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_play_ref = wx.Button(p, label="&Play Reference (P)")
         self.btn_record = wx.Button(p, label="&Start Recording (Space)")
+        self.btn_accept = wx.Button(p, label="&Accept && Next (A)")
+        self.btn_retake = wx.Button(p, label="&Retake (R)")
+        self.btn_play_ref = wx.Button(p, label="&Play Reference (P)")
         self.btn_listen = wx.Button(p, label="&Listen Take (L)")
-        self.btn_accept = wx.Button(p, label="&Accept && Next (Enter)")
         self.btn_prev = wx.Button(p, label="Pre&vious")
         self.btn_skip = wx.Button(p, label="S&kip")
 
-        self.btn_play_ref.Bind(wx.EVT_BUTTON, lambda _e: self._play_current_reference())
         self.btn_record.Bind(wx.EVT_BUTTON, lambda _e: self._toggle_recording())
-        self.btn_listen.Bind(wx.EVT_BUTTON, lambda _e: self._listen_current_take())
         self.btn_accept.Bind(wx.EVT_BUTTON, lambda _e: self._accept_and_advance())
+        self.btn_retake.Bind(wx.EVT_BUTTON, lambda _e: self._retake_current())
+        self.btn_play_ref.Bind(wx.EVT_BUTTON, lambda _e: self._play_current_reference())
+        self.btn_listen.Bind(wx.EVT_BUTTON, lambda _e: self._listen_current_take())
         self.btn_prev.Bind(wx.EVT_BUTTON, lambda _e: self._move_cursor(-1))
         self.btn_skip.Bind(wx.EVT_BUTTON, lambda _e: self._move_cursor(+1))
 
-        for b in (self.btn_play_ref, self.btn_record, self.btn_listen, self.btn_accept, self.btn_prev, self.btn_skip):
+        for b in (
+            self.btn_record,
+            self.btn_accept,
+            self.btn_retake,
+            self.btn_play_ref,
+            self.btn_listen,
+            self.btn_prev,
+            self.btn_skip,
+        ):
             act_row.Add(b, 0, wx.RIGHT, 6)
         ps.Add(act_row, 0, wx.ALL, 6)
 
@@ -360,7 +388,7 @@ class StudioPanel(wx.Panel):
         else:
             self.cursor = max(0, min(self.cursor, max(0, len(self.filtered_indices) - 1)))
 
-        self._show_current_prompt(check_transition=False)
+        self._show_current_prompt(check_transition=False, auto_speak=False)
         self.frame.update_nav_buttons()
 
     def _current_item(self) -> Optional[Dict[str, object]]:
@@ -371,13 +399,14 @@ class StudioPanel(wx.Panel):
     def _remaining_supplements_count(self, from_line_idx: int) -> int:
         return sum(1 for item in self.lines[from_line_idx:] if item.get("kind") != "word")
 
-    def _show_current_prompt(self, *, check_transition: bool = True) -> None:
+    def _show_current_prompt(self, *, check_transition: bool = True, auto_speak: bool = True) -> None:
         item = self._current_item()
         if item is None:
             self.lbl_prompt_header.SetLabel("All prompts in this filter are complete!")
-            self.txt_prompt.SetValue("Done!")
+            self.lbl_prompt_word.SetLabel("Done!")
             self.lbl_prompt_ipa.SetLabel("Click Next to proceed to Alignment.")
             self.btn_record.Enable(False)
+            self.btn_retake.Enable(False)
             self.btn_play_ref.Enable(False)
             self.btn_listen.Enable(False)
             self.btn_accept.Enable(False)
@@ -398,7 +427,7 @@ class StudioPanel(wx.Panel):
                 f"The remaining {rem} prompt(s) are short nonsense sounds covering rare transitions.\n"
                 f"Each nonsense line will automatically play its pronunciation reference — "
                 f"listen carefully and repeat the sounds in your own natural voice.\n\n"
-                f"Press P anytime to replay the reference.",
+                f"Press Space to resume recording, A to accept, R to retake, or P to replay the reference.",
                 "Nonsense Supplement Lines Ahead",
                 wx.OK | wx.ICON_INFORMATION,
                 parent=self,
@@ -409,37 +438,37 @@ class StudioPanel(wx.Panel):
         self.lbl_prompt_header.SetLabel(
             f"Line {ln:04d} of {len(self.lines)}  —  {kind_txt}  ({self.cursor + 1} / {len(self.filtered_indices)} in view)"
         )
-        self.txt_prompt.SetValue(str(item["text"]) if is_word else f"[{item['text']}]")
+        self.lbl_prompt_word.SetLabel(str(item["text"]) if is_word else f"[{item['text']}]")
         self.lbl_prompt_ipa.SetLabel("IPA: " + " ".join(item.get("ipa", [])))
 
         has_take = self._is_recorded(ln)
         self.btn_record.Enable(True)
+        self.btn_retake.Enable(True)
         self.btn_play_ref.Enable(True)
         self.btn_listen.Enable(has_take)
         self.btn_accept.Enable(has_take or self.recorder.is_recording)
         if self.recorder.is_recording:
             self.txt_verdict.SetValue(
-                "RECORDING (continuous)... Speak the prompt, then press Enter to save && advance (Space to stop)."
+                "RECORDING (continuous)... Speak the prompt, then press A to accept && advance, R to retake, or Space to stop."
             )
         elif has_take:
-            self.txt_verdict.SetValue("Take already recorded. Press L to listen, Space to re-record, or Enter for next.")
+            self.txt_verdict.SetValue("Take already recorded. Press L to listen, Space to re-record, R to retake, or A for next.")
         else:
             self.txt_verdict.SetValue(
-                "Press Space to start recording, speak naturally, then press Enter to save && advance (or Space to stop)."
+                "Press Space on Start Recording, speak clearly, then press A to accept && advance (R to retake, P to replay)."
             )
 
         if 0 <= self.cursor < self.list_studio.GetItemCount():
             self.list_studio.Select(self.cursor)
-            self.list_studio.Focus(self.cursor)
-            self.list_studio.SetItemState(
-                self.cursor,
-                wx.LIST_STATE_SELECTED | wx.LIST_STATE_FOCUSED,
-                wx.LIST_STATE_SELECTED | wx.LIST_STATE_FOCUSED,
-            )
+            if wx.Window.FindFocus() is self.list_studio:
+                self.list_studio.Focus(self.cursor)
             self.list_studio.EnsureVisible(self.cursor)
 
-        # Auto-play eSpeak reference immediately on every nonsense supplement line!
-        if not is_word:
+        # Auto-speak current prompt with eSpeak (for all words when Auto-speak is checked,
+        # and always for nonsense supplements). Only skip during non-continuous recording
+        # to avoid speaker bleed.
+        should_speak = auto_speak and (self.chk_auto_speak.GetValue() or (not is_word))
+        if should_speak and (self.chk_continuous.GetValue() or not self.recorder.is_recording):
             wx.CallAfter(self._play_current_reference)
 
     def _sync_record_button(self) -> None:
@@ -466,6 +495,24 @@ class StudioPanel(wx.Panel):
                 wx.CallAfter(self.txt_verdict.SetValue, f"Reference playback error: {exc}")
 
         threading.Thread(target=_play, daemon=True).start()
+
+    def _play_retry_cue_and_reference(self, item: Dict[str, object], *, speak_again: bool) -> None:
+        """Play a brief descending warning tone, then optionally re-speak the same prompt."""
+        proj = self.frame.project
+        if proj is None:
+            return
+        voice = proj.config.espeak_voice
+        vowels = list(self.vowels)
+
+        def _worker() -> None:
+            try:
+                play_warning_tone(blocking=True)
+                if speak_again:
+                    play_prompt_reference(item, voice, vowels, blocking=False)
+            except Exception as exc:
+                wx.CallAfter(self.txt_verdict.SetValue, f"Reference playback error: {exc}")
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _finish_save_feedback(self, ln: int, q) -> None:
         self.txt_verdict.SetValue(q.verdict)
@@ -496,11 +543,13 @@ class StudioPanel(wx.Panel):
             self.btn_accept.Enable(True)
             if continuous:
                 self.txt_verdict.SetValue(
-                    "RECORDING (continuous)... Speak clearly, press Enter to save && advance (P replays ref on headphones, Space stops)."
+                    "RECORDING (continuous)... Speak clearly, press A to accept && advance, R to retake, Space to stop."
                 )
+                if self.chk_auto_speak.GetValue() or item.get("kind") != "word":
+                    wx.CallAfter(self._play_current_reference)
             else:
                 self.txt_verdict.SetValue(
-                    "RECORDING... Speak clearly, then press Enter to save && advance or Space to stop."
+                    "RECORDING... Speak clearly, then press A to accept && advance or Space to stop."
                 )
             self.frame.announce_status(f"Recording line {ln:04d}...")
         else:
@@ -508,6 +557,27 @@ class StudioPanel(wx.Panel):
             q = self.recorder.stop_and_save(dest, calibrated_noise_db=self.calibrated_noise_db)
             self._sync_record_button()
             self._finish_save_feedback(ln, q)
+
+    def _retake_current(self) -> None:
+        item = self._current_item()
+        if item is None:
+            return
+        continuous = self.chk_continuous.GetValue()
+        want_speak = self.chk_auto_speak.GetValue() or (item.get("kind") != "word")
+        if self.recorder.is_recording:
+            if continuous:
+                self.recorder.clear_buffer()
+                self.txt_verdict.SetValue(
+                    "Retaking (still recording) — listen and speak the prompt again, then press A."
+                )
+                if want_speak:
+                    wx.CallAfter(self._play_current_reference)
+                return
+            self.recorder.abort()
+            self._sync_record_button()
+        self.txt_verdict.SetValue("Ready to retake — press Space to record.")
+        if want_speak:
+            wx.CallAfter(self._play_current_reference)
 
     def _listen_current_take(self) -> None:
         item = self._current_item()
@@ -525,28 +595,48 @@ class StudioPanel(wx.Panel):
         item = self._current_item()
         if item is None:
             return
+        ln = int(item["line"])
         continuous = self.chk_continuous.GetValue()
         has_next = (self.cursor + 1) < len(self.filtered_indices)
         if self.recorder.is_recording:
-            ln = int(item["line"])
             dest = self._take_path(ln)
-            if continuous and has_next:
-                # Save current line and keep the microphone rolling straight into the next prompt!
-                q = self.recorder.flush_and_save_keep_recording(dest, calibrated_noise_db=self.calibrated_noise_db)
-                self._finish_save_feedback(ln, q)
+            if continuous:
+                # Extract & clear buffer while keeping the mic rolling in case a retry is needed
+                audio = self.recorder.flush_buffer()
             else:
-                q = self.recorder.stop_and_save(dest, calibrated_noise_db=self.calibrated_noise_db)
+                audio = self.recorder.stop_buffer()
                 self._sync_record_button()
-                self._finish_save_feedback(ln, q)
+
+            q = analyze_take(audio, self.recorder.sample_rate, calibrated_noise_db=self.calibrated_noise_db)
+            severe_low_snr = q.low_snr if (self.calibrated_noise_db is not None) else (q.snr_db < 8.0)
+            if q.clipped or q.too_quiet or q.too_short or severe_low_snr:
+                # Reject bad take: stay on the same prompt, warn with tone, and replay the word
+                self.txt_verdict.SetValue(f"RETRY — {q.verdict}")
+                if 0 <= self.cursor < self.list_studio.GetItemCount():
+                    self.list_studio.SetItem(self.cursor, 3, "Check Take")
+                self.frame.announce_status(f"Line {ln:04d} retry needed: {q.verdict}")
+                speak_again = (
+                    (self.chk_auto_speak.GetValue() or (item.get("kind") != "word"))
+                    and (continuous or not self.recorder.is_recording)
+                )
+                self._play_retry_cue_and_reference(item, speak_again=speak_again)
+                return
+
+            if continuous and not has_next:
+                self.recorder.abort()
+                self._sync_record_button()
+
+            save_take_wav(audio, dest, self.recorder.sample_rate)
+            self._finish_save_feedback(ln, q)
+        else:
+            if not self._is_recorded(ln):
+                return
+
         if not (continuous and self.recorder.is_recording):
             stop_playback()
         if has_next:
             self.cursor += 1
-            self._show_current_prompt(check_transition=True)
-            # Re-focus the read-only prompt display so NVDA immediately reads the next word
-            self.btn_record.SetFocus()
-            self.txt_prompt.SetFocus()
-            self.txt_prompt.SelectAll()
+            self._show_current_prompt(check_transition=True, auto_speak=True)
         else:
             self._rebuild_filter(reset_cursor=False)
             self.frame.announce_status("Reached end of prompt list. Click Next to run MFA alignment.")
@@ -559,14 +649,14 @@ class StudioPanel(wx.Panel):
         if not self.filtered_indices:
             return
         self.cursor = max(0, min(len(self.filtered_indices) - 1, self.cursor + delta))
-        self._show_current_prompt(check_transition=delta > 0)
+        self._show_current_prompt(check_transition=delta > 0, auto_speak=True)
 
     def _on_studio_list_activate(self, evt: wx.ListEvent) -> None:
         if self.recorder.is_recording:
             self.recorder.abort()
             self._sync_record_button()
         self.cursor = evt.GetIndex()
-        self._show_current_prompt(check_transition=True)
+        self._show_current_prompt(check_transition=True, auto_speak=True)
 
     def _on_mic_check(self, _evt: wx.CommandEvent) -> None:
         dev = self._selected_mic_device()
@@ -606,7 +696,7 @@ class StudioPanel(wx.Panel):
             return
 
         # Never hijack Space from native interactive controls (buttons, checkboxes, choices, lists).
-        # Note: when focus is on btn_record (the default), Space naturally presses btn_record!
+        # When focus is on btn_record, Space naturally starts/stops recording!
         native_space_controls = (
             wx.Button,
             wx.CheckBox,
@@ -628,28 +718,18 @@ class StudioPanel(wx.Panel):
             evt.Skip()
             return
 
+        if code in (ord("A"), ord("a")):
+            self._accept_and_advance()
+            return
+        if code in (ord("R"), ord("r")):
+            self._retake_current()
+            return
         if code in (ord("P"), ord("p")):
             self._play_current_reference()
             return
         if code in (ord("L"), ord("l")):
             self._listen_current_take()
             return
-        if code in (ord("R"), ord("r")):
-            if self.recorder.is_recording:
-                if self.chk_continuous.GetValue():
-                    self.recorder.clear_buffer()
-                    self.txt_verdict.SetValue("Buffer cleared (still recording) — speak the prompt again, then Enter.")
-                    return
-                self.recorder.abort()
-                self._sync_record_button()
-            self.txt_verdict.SetValue("Ready to retake — press Space (or F5) to record.")
-            return
-        # Enter accepts & advances when focused on the Record button OR non-button studio display controls
-        if code in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if focused is self.btn_record or not isinstance(focused, (wx.Button, wx.ListCtrl, wx.Choice, wx.ComboBox)):
-                if self.recorder.is_recording or self.btn_accept.IsEnabled():
-                    self._accept_and_advance()
-                    return
         evt.Skip()
 
     # ------------------------------------------------------------------ External Recorder Import handlers
