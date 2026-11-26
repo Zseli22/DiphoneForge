@@ -32,6 +32,7 @@ class InputDevice:
 @dataclass(frozen=True)
 class TakeQuality:
     duration_s: float
+    active_speech_s: float
     peak: float
     rms_db: float
     noise_db: float
@@ -40,10 +41,16 @@ class TakeQuality:
     too_quiet: bool
     too_short: bool
     low_snr: bool
+    excess_silence: bool = False
 
     @property
     def ok(self) -> bool:
-        return not (self.clipped or self.too_quiet or self.too_short or self.low_snr)
+        return not (self.clipped or self.too_quiet or self.too_short or self.excess_silence)
+
+    @property
+    def needs_warning(self) -> bool:
+        """True only for genuine recording problems (silent/quiet, insanely short, excessive silence, or hard clipping)."""
+        return self.clipped or self.too_quiet or self.too_short or self.excess_silence
 
     @property
     def verdict(self) -> str:
@@ -51,14 +58,18 @@ class TakeQuality:
         if self.clipped:
             issues.append(f"CLIPPED (peak {self.peak:.2f}) — move slightly back or lower mic gain")
         if self.too_short:
-            issues.append(f"TOO SHORT ({self.duration_s:.2f} s)")
+            issues.append(f"VERY SHORT ({self.active_speech_s:.2f} s speech / {self.duration_s:.2f} s total)")
         if self.too_quiet:
-            issues.append(f"TOO QUIET ({self.rms_db:.1f} dBFS)")
-        if self.low_snr:
-            issues.append(f"LOW SNR ({self.snr_db:.1f} dB above noise)")
+            issues.append(f"VERY QUIET ({self.rms_db:.1f} dBFS, SNR {self.snr_db:.1f} dB)")
+        if self.excess_silence:
+            issues.append(f"TOO MUCH SILENCE ({self.duration_s:.1f} s total, only {self.active_speech_s:.2f} s speech)")
         if not issues:
-            return f"GOOD — {self.duration_s:.2f} s, peak {self.peak:.2f}, SNR {self.snr_db:.1f} dB"
-        return "CHECK TAKE: " + "; ".join(issues)
+            extra = f" (borderline SNR {self.snr_db:.1f} dB)" if self.low_snr else ""
+            return (
+                f"GOOD — {self.active_speech_s:.2f} s speech ({self.duration_s:.2f} s clip), "
+                f"peak {self.peak:.2f}, SNR {self.snr_db:.1f} dB{extra}"
+            )
+        return "WARNING: " + "; ".join(issues)
 
 
 def list_input_devices() -> List[InputDevice]:
@@ -105,7 +116,12 @@ def analyze_take(
     *,
     calibrated_noise_db: Optional[float] = None,
 ) -> TakeQuality:
-    """Run instant clipping, level, SNR, and duration diagnostics on a recorded take."""
+    """Run clipping, active-speech level, SNR, and excess-silence diagnostics on a recorded take.
+
+    Uses the active speech peak window (top ~50-80 ms) rather than whole-buffer percentile(90),
+    so short single-syllable words like "took" inside a 2-3 s continuous-mode buffer are
+    measured on their actual vowel energy instead of surrounding silence.
+    """
     mono = audio[:, 0] if audio.ndim > 1 else audio
     mono = np.asarray(mono, dtype=np.float32)
     dur = len(mono) / float(sr) if sr > 0 else 0.0
@@ -120,24 +136,41 @@ def analyze_take(
         frame_rms = np.sqrt(np.maximum(0.0, (cs[idx + win] - cs[idx]) / win))
         frame_db = 20.0 * np.log10(np.maximum(frame_rms, 1e-12))
         local_noise = float(np.percentile(frame_db, 15))
-        speech_rms = float(np.percentile(frame_db, 90))
+        noise_db = min(local_noise, calibrated_noise_db) if calibrated_noise_db is not None else local_noise
+
+        # Active speech frames: at least +8 dB above room noise and above -48 dBFS
+        speech_thresh = max(noise_db + 8.0, -48.0)
+        active_frames = frame_db[frame_db > speech_thresh]
+        active_speech_s = len(active_frames) * 0.010
+
+        # Measure speech loudness from the top 4-8 loudest active frames (40-80 ms),
+        # so short CVC words ("took", "cat", "bit") are never diluted by surrounding silence.
+        sorted_db = np.sort(frame_db)
+        top_n = max(3, min(8, len(active_frames) if len(active_frames) >= 3 else min(5, len(sorted_db))))
+        speech_rms = float(np.mean(sorted_db[-top_n:]))
     else:
         local_noise = _rms_db(mono)
+        noise_db = min(local_noise, calibrated_noise_db) if calibrated_noise_db is not None else local_noise
         speech_rms = local_noise
+        active_speech_s = dur if speech_rms > max(noise_db + 8.0, -48.0) else 0.0
 
-    noise_db = min(local_noise, calibrated_noise_db) if calibrated_noise_db is not None else local_noise
     snr_db = speech_rms - noise_db
+    too_quiet = (speech_rms < -42.0) or (snr_db < 7.0)
+    too_short = (dur < 0.14) or (active_speech_s < 0.05)
+    excess_silence = (dur > 5.5) and (active_speech_s < dur * 0.10)
 
     return TakeQuality(
         duration_s=round(dur, 3),
+        active_speech_s=round(active_speech_s, 3),
         peak=round(peak, 4),
         rms_db=round(speech_rms, 1),
         noise_db=round(noise_db, 1),
         snr_db=round(snr_db, 1),
-        clipped=peak >= 0.99,
-        too_quiet=speech_rms < -38.0,
-        too_short=dur < 0.20,
-        low_snr=snr_db < 14.0,
+        clipped=peak >= 0.995,
+        too_quiet=too_quiet,
+        too_short=too_short,
+        low_snr=snr_db < 12.0,
+        excess_silence=excess_silence,
     )
 
 
@@ -151,8 +184,13 @@ def calibrate_room_noise(device: Optional[int] = None, duration_s: float = 2.5) 
 
 
 def play_wav_file(path: Path, *, blocking: bool = False) -> None:
-    """Play a WAV file through the default output device."""
+    """Play a WAV file through the default output device (with brief silence tail for PortAudio drain)."""
     audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    pad_n = max(1, int(round(0.22 * sr)))
+    if audio.ndim == 1:
+        audio = np.concatenate([audio, np.zeros(pad_n, dtype=np.float32)])
+    else:
+        audio = np.concatenate([audio, np.zeros((pad_n, audio.shape[1]), dtype=np.float32)], axis=0)
     sd.stop()
     sd.play(audio, sr, blocking=blocking)
 

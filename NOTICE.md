@@ -28,6 +28,7 @@ under which terms, and where the corresponding source can be obtained.
 | PyInstaller (packaging bootloader) | GPL-2.0 with bootloader exception | Used by `build-voicebuilder.ps1` to assemble the standalone Windows executable. |
 | Montreal Forced Aligner & micromamba (downloaded on demand) | MIT / BSD-3-Clause (MFA/Kaldi/micromamba) | **Not bundled** in the Voice Builder archive; downloaded on demand into `cache/` by the user. |
 | FrequencyWords word lists (downloaded on demand) | MIT / CC BY-SA 4.0 (OpenSubtitles derived) | **Not bundled**; downloaded on demand into `cache/wordlists/` from [hermitdave/FrequencyWords](https://github.com/hermitdave/FrequencyWords). |
+| Hunspell spellcheck dictionaries (downloaded on demand) | Per-language open-source licences (MIT / MPL / LGPL / GPL) | **Not bundled**; downloaded on demand into `cache/dictionaries/` from [wooorm/dictionaries](https://github.com/wooorm/dictionaries) to filter non-words and foreign subtitle leaks from prompt lists. |
 | Corpora and derived data (`output/`, `Voice_audio/`, `cache/`) | CC BY 4.0 for this project's own recordings and derivatives | **Not distributed.** These directories are excluded from the repository and release bundles; see README. |
 
 ## Not redistributed at all

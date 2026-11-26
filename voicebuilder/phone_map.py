@@ -25,11 +25,11 @@ ENGLISH_MFA_OVERRIDES: Dict[str, List[str]] = {
     "f": ["f"], "v": ["v"], "T": ["θ"], "D": ["ð"],
     "s": ["s"], "z": ["z"], "S": ["ʃ"], "Z": ["ʒ"], "h": ["h"],
     "m": ["m"], "n": ["n"], "N": ["ŋ"],
-    "l": ["l"], "L": ["ɫ"], "r": ["ɹ"], "w": ["w"], "j": ["j"],
+    "l": ["l"], "L": ["ɫ"], "r": ["ɹ"], "w": ["w"], "j": ["j"], "t#": ["ɾ"],
 }
 
 ENGLISH_MFA_VARIANTS: Dict[str, str] = {
-    "pʰ": "p", "tʰ": "t", "kʰ": "k", "ɫ": "l", "a": "æ", "oː": "ɔ", "əw": "ow",
+    "pʰ": "p", "tʰ": "t", "kʰ": "k", "ɫ": "l", "a": "æ", "oː": "ɔ", "əw": "ow", "ɜː": "ɝ",
 }
 
 # Universal articulatory IPA features for nearest-neighbor fallback

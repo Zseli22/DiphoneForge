@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
 import wx
 
@@ -42,8 +42,42 @@ def record_recent_project(project_dir: Path) -> None:
     f.write_text(json.dumps(items[:10], indent=2) + "\n", encoding="utf-8")
 
 
+def _describe_project_summary(project_dir: Path) -> str:
+    """Build a friendly one-line summary for the Recent Projects list."""
+    try:
+        proj = VoiceProject.load(project_dir)
+    except Exception:
+        return str(project_dir)
+    status_parts: List[str] = []
+    dmap_p = proj.plan_dir / "diphone_map.json"
+    if dmap_p.is_file():
+        try:
+            dmap = json.loads(dmap_p.read_text(encoding="utf-8"))
+            total = len(dmap.get("lines", []))
+            if proj.config.recording_mode == "mic":
+                rec = sum(
+                    1
+                    for it in dmap.get("lines", [])
+                    if (proj.takes_dir / f"line_{int(it['line']):04d}.wav").is_file()
+                    and (proj.takes_dir / f"line_{int(it['line']):04d}.wav").stat().st_size > 1000
+                )
+                status_parts.append(f"{rec}/{total} recorded")
+            else:
+                status_parts.append(f"{total} prompts (external)")
+        except Exception:
+            pass
+    if proj.config.stages.get("build") == "done":
+        status_parts.append("Built")
+    elif proj.audit_file.is_file():
+        status_parts.append("Aligned")
+    elif not status_parts:
+        status_parts.append("New")
+    summary = ", ".join(status_parts)
+    return f"{proj.config.voice_id} ({proj.config.language_id}) — {summary} — {project_dir}"
+
+
 class NewProjectDialog(wx.Dialog):
-    """Accessible dialog to create a new voice project folder."""
+    """Streamlined dialog to create a new voice project folder (Language, Voice ID, Folder)."""
 
     def __init__(self, parent: wx.Window, catalog: LanguageCatalog) -> None:
         super().__init__(parent, title="New Voice Project", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
@@ -51,7 +85,7 @@ class NewProjectDialog(wx.Dialog):
         self.specs = catalog.all()
 
         root_sizer = wx.BoxSizer(wx.VERTICAL)
-        grid = wx.FlexGridSizer(cols=2, vgap=8, hgap=10)
+        grid = wx.FlexGridSizer(cols=2, vgap=10, hgap=10)
         grid.AddGrowableCol(1, 1)
 
         # Language
@@ -82,33 +116,14 @@ class NewProjectDialog(wx.Dialog):
         grid.Add(lbl_dir, 0, wx.ALIGN_CENTER_VERTICAL)
         grid.Add(dir_row, 1, wx.EXPAND)
 
-        # Recording Mode
-        lbl_mode = wx.StaticText(self, label="Recording &Workflow:")
-        self.choice_mode = wx.Choice(
-            self,
-            choices=[
-                "Built-in PC Microphone Studio (record line by line)",
-                "External Recorder Import (import long WAV files + ranges)",
-            ],
-        )
-        self.choice_mode.SetName("Recording Workflow")
-        self.choice_mode.SetSelection(0)
-        grid.Add(lbl_mode, 0, wx.ALIGN_CENTER_VERTICAL)
-        grid.Add(self.choice_mode, 1, wx.EXPAND)
-
-        # Sample rates
-        lbl_rates = wx.StaticText(self, label="Target &Sample Rates:")
-        rate_row = wx.BoxSizer(wx.HORIZONTAL)
-        self.chk_22k = wx.CheckBox(self, label="22.05 kHz (default, higher clarity)")
-        self.chk_22k.SetValue(True)
-        self.chk_16k = wx.CheckBox(self, label="16 kHz (smaller && faster)")
-        self.chk_16k.SetValue(False)
-        rate_row.Add(self.chk_22k, 0, wx.RIGHT, 12)
-        rate_row.Add(self.chk_16k, 0)
-        grid.Add(lbl_rates, 0, wx.ALIGN_CENTER_VERTICAL)
-        grid.Add(rate_row, 1, wx.EXPAND)
-
         root_sizer.Add(grid, 1, wx.EXPAND | wx.ALL, 12)
+
+        hint = wx.StaticText(
+            self,
+            label="Recording workflow (PC mic vs external recorder) is chosen on Step 2; target sample rates are chosen on Step 4.",
+        )
+        hint.Wrap(520)
+        root_sizer.Add(hint, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
 
         btns = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
         root_sizer.Add(btns, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
@@ -116,7 +131,7 @@ class NewProjectDialog(wx.Dialog):
         self.txt_vid.Bind(wx.EVT_TEXT, self._on_vid_changed)
         self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
         self.SetSizerAndFit(root_sizer)
-        self.SetMinSize((560, 290))
+        self.SetMinSize((560, 220))
         install_mnemonic_handler(self)
         self.choice_lang.SetFocus()
 
@@ -139,27 +154,20 @@ class NewProjectDialog(wx.Dialog):
             wx.MessageBox(str(exc), "Invalid Voice ID", wx.OK | wx.ICON_WARNING, parent=self)
             self.txt_vid.SetFocus()
             return
-        if not self.chk_16k.GetValue() and not self.chk_22k.GetValue():
-            wx.MessageBox("Select at least one target sample rate.", "Sample Rate Required", wx.OK | wx.ICON_WARNING, parent=self)
-            return
         self.EndModal(wx.ID_OK)
 
     def create_project(self) -> VoiceProject:
         spec = self.specs[self.choice_lang.GetSelection()]
-        rates: List[int] = []
-        if self.chk_22k.GetValue():
-            rates.append(22050)
-        if self.chk_16k.GetValue():
-            rates.append(16000)
-        mode = "mic" if self.choice_mode.GetSelection() == 0 else "external"
         wl = "auto" if spec.has_auto_wordlist else ""
         return VoiceProject.create(
             Path(self.txt_dir.GetValue()),
             self.txt_vid.GetValue(),
             spec,
-            rates=rates,
+            rates=[22050],
             wordlist_source=wl,
-            recording_mode=mode,
+            recording_mode="mic",
+            max_words=0,
+            include_supplements=True,
         )
 
 
@@ -169,6 +177,8 @@ class HomePanel(wx.Panel):
     def __init__(self, parent: wx.Window, frame: "WizardFrame") -> None:
         super().__init__(parent)
         self.frame = frame
+        self._recent_paths: List[str] = []
+        self._doctor_expanded: bool = False
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -176,10 +186,10 @@ class HomePanel(wx.Panel):
             self,
             label=(
                 "Create a new MBROLA voice project or open an existing one. "
-                "Word lists and MFA alignment models are downloaded on demand into the app's portable cache folder."
+                "Word lists, Hunspell dictionaries, and MFA alignment models are downloaded on demand into the portable cache folder."
             ),
         )
-        intro.Wrap(720)
+        intro.Wrap(760)
         sizer.Add(intro, 0, wx.BOTTOM, 10)
 
         # Project actions
@@ -198,54 +208,67 @@ class HomePanel(wx.Panel):
         btn_row.Add(self.btn_open_recent, 0)
         proj_sizer.Add(btn_row, 0, wx.ALL, 6)
 
-        lbl_recent = wx.StaticText(self, label="&Recent Projects (press Enter or double-click to open):")
+        lbl_recent = wx.StaticText(self, label="&Recent Projects (press Enter or double-click to resume):")
         self.list_recent = wx.ListBox(self, style=wx.LB_SINGLE)
         self.list_recent.SetName("Recent Projects")
-        self.list_recent.SetMinSize((-1, 80))
+        self.list_recent.SetMinSize((-1, 110))
         self.list_recent.Bind(wx.EVT_LISTBOX_DCLICK, self._on_open_recent)
         self.list_recent.Bind(wx.EVT_LISTBOX, self._on_recent_selection_changed)
         self.list_recent.Bind(wx.EVT_CHAR_HOOK, self._on_recent_key)
         proj_sizer.Add(lbl_recent, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
-        proj_sizer.Add(self.list_recent, 0, wx.EXPAND | wx.ALL, 6)
+        proj_sizer.Add(self.list_recent, 1, wx.EXPAND | wx.ALL, 6)
 
         self.lbl_current = wx.StaticText(self, label="Current Project: (none loaded)")
         proj_sizer.Add(self.lbl_current, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
-        sizer.Add(proj_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
+        sizer.Add(proj_sizer, 1, wx.EXPAND | wx.BOTTOM, 10)
 
-        # Environment & Clean-Slate Setup Doctor
-        doc_box = wx.StaticBox(self, label="Environment & On-Demand Downloads Doctor")
-        doc_sizer = wx.StaticBoxSizer(doc_box, wx.VERTICAL)
+        # Compact Environment & Clean-Slate Setup Doctor
+        doc_box = wx.StaticBox(self, label="Environment & On-Demand Tools")
+        self.doc_sizer = wx.StaticBoxSizer(doc_box, wx.VERTICAL)
 
-        self.list_doctor = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.BORDER_SUNKEN)
-        self.list_doctor.SetName("Environment Doctor Status")
-        self.list_doctor.InsertColumn(0, "Component", width=220)
-        self.list_doctor.InsertColumn(1, "Status", width=80)
-        self.list_doctor.InsertColumn(2, "Details", width=420)
-        self.list_doctor.SetMinSize((-1, 150))
-        doc_sizer.Add(self.list_doctor, 1, wx.EXPAND | wx.ALL, 6)
-
-        doc_btns = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_refresh = wx.Button(self, label="Re&fresh Status")
-        self.btn_install_mfa = wx.Button(self, label="&Install MFA Runtime (On-Demand)")
+        top_doc = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_doc_summary = wx.StaticText(self, label="Checking environment...")
+        self.btn_toggle_doc = wx.Button(self, label="Environment &Details")
+        self.btn_refresh = wx.Button(self, label="Re&fresh")
+        self.btn_install_mfa = wx.Button(self, label="&Install MFA Runtime")
+        self.btn_toggle_doc.Bind(wx.EVT_BUTTON, self._on_toggle_doctor)
         self.btn_refresh.Bind(wx.EVT_BUTTON, lambda _e: self.refresh_doctor())
         self.btn_install_mfa.Bind(wx.EVT_BUTTON, self._on_install_mfa)
-        doc_btns.Add(self.btn_refresh, 0, wx.RIGHT, 8)
-        doc_btns.Add(self.btn_install_mfa, 0)
-        doc_sizer.Add(doc_btns, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        top_doc.Add(self.lbl_doc_summary, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        top_doc.Add(self.btn_toggle_doc, 0, wx.RIGHT, 6)
+        top_doc.Add(self.btn_refresh, 0, wx.RIGHT, 6)
+        top_doc.Add(self.btn_install_mfa, 0)
+        self.doc_sizer.Add(top_doc, 0, wx.EXPAND | wx.ALL, 6)
+
+        self.doc_details_panel = wx.Panel(self)
+        det_s = wx.BoxSizer(wx.VERTICAL)
+        self.list_doctor = wx.ListCtrl(self.doc_details_panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.BORDER_SUNKEN)
+        self.list_doctor.SetName("Environment Doctor Status")
+        self.list_doctor.InsertColumn(0, "Component", width=230)
+        self.list_doctor.InsertColumn(1, "Status", width=80)
+        self.list_doctor.InsertColumn(2, "Details", width=440)
+        self.list_doctor.SetMinSize((-1, 130))
+        det_s.Add(self.list_doctor, 1, wx.EXPAND | wx.BOTTOM, 4)
 
         note = wx.StaticText(
-            self,
-            label=(
-                f"Portable cache folder: {get_cache_root()}  "
-                "(Note: word lists and MFA models stay fully portable; a fresh micromamba MFA install "
-                "binds to its install path if the app folder is moved later.)"
-            ),
+            self.doc_details_panel,
+            label=f"Portable cache folder: {get_cache_root()}",
         )
-        note.Wrap(720)
-        doc_sizer.Add(note, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        det_s.Add(note, 0)
+        self.doc_details_panel.SetSizer(det_s)
+        self.doc_sizer.Add(self.doc_details_panel, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
-        sizer.Add(doc_sizer, 1, wx.EXPAND)
+        sizer.Add(self.doc_sizer, 0, wx.EXPAND)
         self.SetSizer(sizer)
+
+    def _set_doctor_expanded(self, expanded: bool) -> None:
+        self._doctor_expanded = expanded
+        self.doc_details_panel.Show(expanded)
+        self.btn_toggle_doc.SetLabel("Hide &Details" if expanded else "Environment &Details")
+        self.Layout()
+
+    def _on_toggle_doctor(self, _evt: wx.CommandEvent) -> None:
+        self._set_doctor_expanded(not self._doctor_expanded)
 
     def on_enter(self) -> None:
         self.refresh_recent()
@@ -261,26 +284,40 @@ class HomePanel(wx.Panel):
 
     def refresh_recent(self) -> None:
         self.list_recent.Clear()
-        items = load_recent_projects()
-        for p in items:
-            self.list_recent.Append(p)
-        if items:
+        self._recent_paths = load_recent_projects()
+        for p in self._recent_paths:
+            self.list_recent.Append(_describe_project_summary(Path(p)))
+        if self._recent_paths:
             self.list_recent.SetSelection(0)
-        self.btn_open_recent.Enable(bool(items))
+        self.btn_open_recent.Enable(bool(self._recent_paths))
 
     def _on_recent_selection_changed(self, _evt: wx.CommandEvent) -> None:
         self.btn_open_recent.Enable(self.list_recent.GetSelection() != wx.NOT_FOUND)
 
     def refresh_doctor(self) -> None:
         self.list_doctor.DeleteAllItems()
+        statuses = run_doctor()
         mfa_ok = False
-        for idx, st in enumerate(run_doctor()):
+        missing_names: List[str] = []
+        cache_detail = ""
+        for idx, st in enumerate(statuses):
             row = self.list_doctor.InsertItem(idx, st.name)
             self.list_doctor.SetItem(row, 1, "Ready" if st.ok else "Missing")
             self.list_doctor.SetItem(row, 2, st.detail)
             if "Montreal Forced Aligner" in st.name:
                 mfa_ok = st.ok
+            if st.name == "Portable Cache":
+                cache_detail = st.detail
+            if not st.ok:
+                missing_names.append(st.name)
+        self.btn_install_mfa.Show(not mfa_ok)
         self.btn_install_mfa.Enable(not mfa_ok)
+        if not missing_names:
+            self.lbl_doc_summary.SetLabel(f"All tools ready (eSpeak NG, MBROLATOR, MFA)  |  Cache: {cache_detail}")
+            self._set_doctor_expanded(False)
+        else:
+            self.lbl_doc_summary.SetLabel(f"Setup needed: {', '.join(missing_names)}")
+            self._set_doctor_expanded(True)
 
     def _load_project_dir(self, path: Path) -> None:
         try:
@@ -290,7 +327,7 @@ class HomePanel(wx.Panel):
             return
         record_recent_project(proj.root)
         self.frame.set_project(proj)
-        self.frame.go_to_step(1)
+        self.frame.go_to_step(self.frame.smart_resume_step(proj))
 
     def _on_new_project(self, _evt: wx.CommandEvent) -> None:
         with NewProjectDialog(self, self.frame.catalog) as dlg:
@@ -311,8 +348,8 @@ class HomePanel(wx.Panel):
 
     def _on_open_recent(self, _evt: wx.CommandEvent) -> None:
         sel = self.list_recent.GetSelection()
-        if sel != wx.NOT_FOUND:
-            self._load_project_dir(Path(self.list_recent.GetString(sel)))
+        if 0 <= sel < len(self._recent_paths):
+            self._load_project_dir(Path(self._recent_paths[sel]))
 
     def _on_recent_key(self, evt: wx.KeyEvent) -> None:
         if evt.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
@@ -323,7 +360,7 @@ class HomePanel(wx.Panel):
     def _on_install_mfa(self, _evt: wx.CommandEvent) -> None:
         res = wx.MessageBox(
             "This will download micromamba (~10 MB if needed) and install Montreal Forced Aligner "
-            "(~2.4 GB one-time download) into the app's cache folder.\n\nProceed?",
+            "(~415 MB one-time download, ~2.4 GB installed) into the app's cache folder.\n\nProceed?",
             "Install MFA Runtime",
             wx.YES_NO | wx.ICON_QUESTION,
             parent=self,

@@ -28,6 +28,14 @@ def _ensure_project_preview_stage(project: VoiceProject) -> Path:
         if stage.exists():
             shutil.rmtree(stage)
         shutil.copytree(src, stage)
+    else:
+        for bin_name in ("espeakMbrolaHost.exe", "mbrola_stream.dll"):
+            src_bin = src / bin_name
+            dst_bin = stage / bin_name
+            if src_bin.is_file() and (
+                not dst_bin.is_file() or src_bin.stat().st_mtime > dst_bin.stat().st_mtime + 0.5
+            ):
+                shutil.copy2(src_bin, dst_bin)
     return stage
 
 

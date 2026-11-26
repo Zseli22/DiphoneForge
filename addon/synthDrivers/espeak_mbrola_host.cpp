@@ -10,10 +10,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -161,6 +163,7 @@ std::vector<ProbeMarker> probeMarkers;
 bool collectProbeMarkers = false;
 
 constexpr int MBROLA_BASE_RATE = 175;
+constexpr int PHO_LONG_VOWEL_FLOOR_MS = 36;
 constexpr int PHO_VOWEL_FLOOR_MS = 25;
 constexpr int PHO_CONSONANT_FLOOR_MS = 15;
 constexpr int PHO_PAUSE_FLOOR_MS = 8;
@@ -510,10 +513,46 @@ std::string makeTempPath(const char* suffix) {
 
 bool isVowelPhone(const std::string& phone) {
 	static const std::set<std::string> vowels = {
-		"a", "A", "A:", "E", "I", "O", "U", "@", "3", "3:", "i:", "u:",
-		"aI", "aU", "eI", "OI", "oU", "0", "0:",
+		// Short / monophthong vowels (eSpeak NG / SAMPA / MBROLA across languages)
+		"a", "A", "e", "E", "i", "I", "o", "O", "u", "U", "y", "Y",
+		"@", "V", "Q", "0", "2", "3", "6", "8", "9", "{", "}",
+		"E2", "I2", "O2", "@2", "@5", "a#", "aa", "r=",
+		// Long vowels
+		"a:", "A:", "e:", "E:", "i:", "I:", "o:", "O:", "u:", "U:",
+		"y:", "Y:", "0:", "2:", "3:", "9:", "6:",
+		// Diphthongs & rhotic vowels (English, Dutch, German, Hungarian, etc.)
+		"aI", "aU", "eI", "OI", "oU", "AI", "AU", "EI", "EU", "OU", "VU",
+		"Ei", "Au", "9y", "Wy", "eU", "yU", "@U", "oI",
+		"i@", "e@", "u@", "U@", "o@", "O@", "A@", "i@3", "aI@", "aU@", "aI3", "aU3", "eI3", "OI3",
+		// Nasalized vowels (French, Portuguese, Polish, etc.)
+		"a~", "A~", "e~", "E~", "o~", "O~", "9~", "i~", "u~",
 	};
 	return vowels.count(phone) != 0;
+}
+
+// eSpeak NG attaches a multi-point pitch contour (at least two time/Hz pairs,
+// i.e. >= 4 whitespace-separated numbers) to every vowel in its .pho output,
+// whereas voiceless consonants have an empty tail and voiced sonorants carry
+// at most one trailing pitch anchor ("100 95"). Checking both this contour and
+// the vowel table keeps duration floors accurate for every language.
+bool hasMultiPointPitchContour(const std::string& tail) {
+	int tokens = 0;
+	bool inToken = false;
+	for (unsigned char ch : tail) {
+		if (ch > ' ') {
+			if (!inToken) {
+				inToken = true;
+				if (++tokens >= 4) return true;
+			}
+		} else {
+			inToken = false;
+		}
+	}
+	return false;
+}
+
+bool isVowelPhoLine(const std::string& phone, const std::string& tail) {
+	return isVowelPhone(phone) || hasMultiPointPitchContour(tail);
 }
 
 struct PhoLine {
@@ -552,14 +591,30 @@ bool adjustPho(
 		} catch (...) {
 			continue;
 		}
-		const int floorMs = phone == "_"
-			? PHO_PAUSE_FLOOR_MS
-			: (isVowelPhone(phone) ? PHO_VOWEL_FLOOR_MS : PHO_CONSONANT_FLOOR_MS);
+		int floorMs = PHO_CONSONANT_FLOOR_MS;
+		if (phone == "_") {
+			floorMs = PHO_PAUSE_FLOOR_MS;
+		} else if (isVowelPhoLine(phone, tail)) {
+			const bool isLongVowel = phone.find(':') != std::string::npos;
+			const int targetVowelFloor = isLongVowel ? PHO_LONG_VOWEL_FLOOR_MS : PHO_VOWEL_FLOOR_MS;
+			// Never lengthen an already-short reduced vowel when speaking faster.
+			floorMs = std::min(targetVowelFloor, std::max(PHO_CONSONANT_FLOOR_MS, duration));
+		}
 		const int rounded = static_cast<int>(std::nearbyint(duration * factor));
 		const int adjusted = std::max(floorMs, rounded);
 		lines.push_back({phone, duration, adjusted, tail});
 	}
 	if (lines.empty()) return false;
+	// Ensure a clean short trailing pause (~50 ms) so the final consonant/diphone
+	// releases naturally without getting clipped by MBROLA EOF or audio-device drain.
+	constexpr int PHO_TRAILING_PAUSE_MS = 50;
+	if (lines.back().phone == "_") {
+		if (lines.back().adjustedMs < PHO_TRAILING_PAUSE_MS) {
+			lines.back().adjustedMs = PHO_TRAILING_PAUSE_MS;
+		}
+	} else {
+		lines.push_back({"_", 0, PHO_TRAILING_PAUSE_MS, ""});
+	}
 	originalCumulative.assign(lines.size() + 1, 0);
 	adjustedCumulative.assign(lines.size() + 1, 0);
 	for (size_t i = 0; i < lines.size(); ++i) {
@@ -710,8 +765,7 @@ bool streamMbrolaAudio(
 	const std::string& phonemes,
 	int sampleRate,
 	std::vector<AudioMarker> markers,
-	double gain,
-	size_t maxSamples
+	double gain
 ) {
 	if (sampleRate <= 0 || phonemes.empty()) return false;
 	std::sort(markers.begin(), markers.end(), [](const AudioMarker& left, const AudioMarker& right) {
@@ -719,22 +773,6 @@ bool streamMbrolaAudio(
 	});
 	const int32_t rate = sampleRate;
 	if (!sendMessage(SAMPLE_RATE, generation, &rate, sizeof(rate))) return false;
-
-	// Push the phoneme stream. A partial write is retried; MBROLA buffers it.
-	size_t written = 0;
-	while (written < phonemes.size()) {
-		if (cancelled.load()) return false;
-		const std::string piece = phonemes.substr(written, std::min<size_t>(1024, phonemes.size() - written));
-		std::string buffer = piece;
-		const int result = mbrolaWrite(&buffer[0]);
-		if (result < 0) return false;
-		if (result == 0) {
-			Sleep(1);
-			continue;
-		}
-		written += static_cast<size_t>(result);
-	}
-	if (!mbrolaFlush()) return false;
 
 	const size_t blockSamples = static_cast<size_t>(std::max(1, sampleRate / 50)); // 20 ms
 	std::vector<short> current(blockSamples);
@@ -766,26 +804,79 @@ bool streamMbrolaAudio(
 		return true;
 	};
 
-	while (true) {
-		if (cancelled.load()) return false;
-		size_t want = blockSamples;
-		if (maxSamples) {
-			const size_t consumed = sentBytes / sizeof(int16_t) + pending.size();
-			if (consumed >= maxSamples) break;
-			want = std::min(want, maxSamples - consumed);
-		}
-		size_t got = 0;
-		while (got < want) {
+	// Drain all audio currently producible by MBROLA without blocking, freeing space
+	// inside MBROLA's 8 KB input FIFO and minimizing time-to-first-audio on long text.
+	auto drainAvailable = [&](size_t& samplesReadOut) -> bool {
+		samplesReadOut = 0;
+		while (true) {
 			if (cancelled.load()) return false;
-			const int result = mbrolaRead(current.data() + got, static_cast<int>(want - got));
-			if (result <= 0) break;
-			got += static_cast<size_t>(result);
+			size_t got = 0;
+			while (got < blockSamples) {
+				if (cancelled.load()) return false;
+				const int result = mbrolaRead(current.data() + got, static_cast<int>(blockSamples - got));
+				if (result <= 0) break;
+				got += static_cast<size_t>(result);
+			}
+			if (got == 0) break;
+			samplesReadOut += got;
+			if (!flushPending(false)) return false;
+			pending.assign(current.begin(), current.begin() + got);
+			if (got < blockSamples) break;
 		}
-		if (got == 0) break;
-		if (!flushPending(false)) return false;
-		pending.assign(current.begin(), current.begin() + got);
-		if (got < want) break;
+		return true;
+	};
+
+	// Interleave newline-aligned writes with reads so paragraphs exceeding MBROLA's
+	// 8,192-byte FIFO_SIZE never deadlock or truncate.
+	size_t written = 0;
+	int zeroProgressRetries = 0;
+	while (written < phonemes.size()) {
+		if (cancelled.load()) return false;
+		const size_t remaining = phonemes.size() - written;
+		size_t chunkLen = std::min<size_t>(1024, remaining);
+		if (chunkLen < remaining) {
+			const size_t lastNl = phonemes.rfind('\n', written + chunkLen - 1);
+			if (lastNl != std::string::npos && lastNl >= written) {
+				chunkLen = lastNl - written + 1;
+			}
+		}
+		std::string buffer = phonemes.substr(written, chunkLen);
+		const int result = mbrolaWrite(&buffer[0]);
+		if (result < 0) return false;
+		if (result == 0) {
+			size_t drained = 0;
+			if (!drainAvailable(drained)) return false;
+			if (drained == 0) {
+				if (++zeroProgressRetries > 100) return false;
+				Sleep(1);
+			} else {
+				zeroProgressRetries = 0;
+			}
+			continue;
+		}
+		zeroProgressRetries = 0;
+		written += static_cast<size_t>(result);
+		size_t drained = 0;
+		if (!drainAvailable(drained)) return false;
 	}
+
+	// Flush MBROLA's parser, draining first if the FIFO happens to be near capacity.
+	bool flushed = false;
+	for (int attempt = 0; attempt < 32; ++attempt) {
+		if (cancelled.load()) return false;
+		if (mbrolaFlush()) {
+			flushed = true;
+			break;
+		}
+		size_t drained = 0;
+		if (!drainAvailable(drained)) return false;
+		if (drained == 0) Sleep(1);
+	}
+	if (!flushed) return false;
+
+	// Drain all remaining audio to natural EOF (no hard maxSamples chop).
+	size_t finalDrained = 0;
+	if (!drainAvailable(finalDrained)) return false;
 	if (!flushPending(true)) return false;
 	return sentBytes > 0;
 }
@@ -1062,15 +1153,8 @@ bool runPhoSynthesis(
 		if (!pcm.empty()) {
 			ok = sendPhoAudio(generation, sampleRate, pcm, markers);
 		} else {
-			// Keep exactly the audio that the adjusted timing model describes and
-			// drop MBROLA's extra release tail.
 			const double gain = phoVolumeGain() * std::clamp(volume, 0, 100) / 100.0;
-			const size_t maxSamples = adjustedCumulative.empty()
-				? 0
-				: static_cast<size_t>(
-					static_cast<double>(adjustedCumulative.back()) * sampleRate / 1000.0
-				);
-			ok = streamMbrolaAudio(generation, adjustedText, sampleRate, markers, gain, maxSamples);
+			ok = streamMbrolaAudio(generation, adjustedText, sampleRate, markers, gain);
 		}
 		audioSent = ok;
 	}
@@ -1123,7 +1207,62 @@ void runSynthesis(uint32_t generation, std::string text) {
 	}
 }
 
-bool processCommand(const Header& header, const std::vector<uint8_t>& payload, std::thread& synthesisThread) {
+struct SpeakJob {
+	uint32_t generation;
+	std::string text;
+};
+
+std::mutex queueMutex;
+std::condition_variable queueCv;
+std::condition_variable idleCv;
+std::deque<SpeakJob> speakQueue;
+bool workerExiting = false;
+bool workerBusy = false;
+
+void synthesisWorkerLoop() {
+	while (true) {
+		SpeakJob job{};
+		{
+			std::unique_lock<std::mutex> lock(queueMutex);
+			queueCv.wait(lock, [] { return workerExiting || !speakQueue.empty(); });
+			if (workerExiting) break;
+			job = std::move(speakQueue.front());
+			speakQueue.pop_front();
+			workerBusy = true;
+			cancelled.store(false);
+			activeGeneration.store(job.generation);
+		}
+		runSynthesis(job.generation, std::move(job.text));
+		{
+			std::lock_guard<std::mutex> lock(queueMutex);
+			workerBusy = false;
+			activeGeneration.store(0);
+		}
+		idleCv.notify_all();
+	}
+}
+
+void cancelPendingAndWait(bool waitForIdle) {
+	std::vector<uint32_t> dropped;
+	{
+		std::lock_guard<std::mutex> lock(queueMutex);
+		while (!speakQueue.empty()) {
+			dropped.push_back(speakQueue.front().generation);
+			speakQueue.pop_front();
+		}
+		if (workerBusy) cancelled.store(true);
+	}
+	for (uint32_t gen : dropped) {
+		sendMessage(CANCELLED, gen, nullptr, 0);
+	}
+	if (waitForIdle) {
+		std::unique_lock<std::mutex> lock(queueMutex);
+		idleCv.wait(lock, [] { return !workerBusy && speakQueue.empty(); });
+		cancelled.store(false);
+	}
+}
+
+bool processCommand(const Header& header, const std::vector<uint8_t>& payload) {
 	if (header.type == SET_PARAMETER && payload.size() == sizeof(ParameterData)) {
 		ParameterData data{};
 		std::memcpy(&data, payload.data(), sizeof(data));
@@ -1132,9 +1271,7 @@ bool processCommand(const Header& header, const std::vector<uint8_t>& payload, s
 		return true;
 	}
 	if (header.type == SET_VOICE || header.type == SET_LANGUAGE) {
-		cancelled.store(true);
-		if (synthesisThread.joinable()) synthesisThread.join();
-		cancelled.store(false);
+		cancelPendingAndWait(true);
 		std::string value(payload.begin(), payload.end());
 		int status = -1;
 		{
@@ -1151,24 +1288,50 @@ bool processCommand(const Header& header, const std::vector<uint8_t>& payload, s
 		return true;
 	}
 	if (header.type == SPEAK) {
-		cancelled.store(true);
-		if (synthesisThread.joinable()) synthesisThread.join();
-		cancelled.store(false);
+		// Queue without cancelling any in-flight utterance so NVDA Say All
+		// plays back-to-back sentences/paragraphs cleanly without cutting tails.
 		std::string text(payload.begin(), payload.end());
-		activeGeneration.store(header.generation);
-		synthesisThread = std::thread(runSynthesis, header.generation, std::move(text));
+		{
+			std::lock_guard<std::mutex> lock(queueMutex);
+			speakQueue.push_back({header.generation, std::move(text)});
+		}
+		queueCv.notify_one();
 		return true;
 	}
 	if (header.type == CANCEL) {
-		const uint32_t active = activeGeneration.load();
-		if (header.generation == 0 || header.generation == active) cancelled.store(true);
+		std::vector<uint32_t> dropped;
+		{
+			std::lock_guard<std::mutex> lock(queueMutex);
+			std::deque<SpeakJob> kept;
+			for (auto& job : speakQueue) {
+				if (header.generation == 0 || job.generation <= header.generation) {
+					dropped.push_back(job.generation);
+				} else {
+					kept.push_back(std::move(job));
+				}
+			}
+			speakQueue = std::move(kept);
+			const uint32_t active = activeGeneration.load();
+			if (workerBusy && (header.generation == 0 || active <= header.generation)) {
+				cancelled.store(true);
+			}
+		}
+		for (uint32_t gen : dropped) {
+			sendMessage(CANCELLED, gen, nullptr, 0);
+		}
 		return true;
 	}
 	return false;
 }
 
 void shutdown(std::thread& synthesisThread) {
-	cancelled.store(true);
+	{
+		std::lock_guard<std::mutex> lock(queueMutex);
+		workerExiting = true;
+		speakQueue.clear();
+		cancelled.store(true);
+	}
+	queueCv.notify_all();
 	if (synthesisThread.joinable()) synthesisThread.join();
 	closeMbrolaEngine();
 	if (espeakTerminate) espeakTerminate();
@@ -1204,7 +1367,7 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	std::thread synthesisThread;
+	std::thread synthesisThread(synthesisWorkerLoop);
 	while (true) {
 		Header header{};
 		if (!readExact(&header, sizeof(header))) break;
@@ -1212,7 +1375,7 @@ int main(int argc, char** argv) {
 		std::vector<uint8_t> payload(header.size);
 		if (header.size && !readExact(payload.data(), header.size)) break;
 		if (header.type == QUIT) break;
-		if (!processCommand(header, payload, synthesisThread)) {
+		if (!processCommand(header, payload)) {
 			sendText(ERROR_MESSAGE, header.generation, "Unknown or malformed helper command");
 		}
 	}

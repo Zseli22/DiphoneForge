@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .catalog import LanguageCatalog
-from .downloader import CancelFn, ProgressFn, ensure_wordlist
-from .paths import get_app_root, get_espeak_paths, tool_subprocess_cmd
+from .downloader import CancelFn, ProgressFn, ensure_dictionary, ensure_wordlist
+from .paths import get_app_root, get_espeak_paths, get_wordlists_cache_dir, tool_subprocess_cmd
 from .project import VoiceProject
 
 # Reuse battle-tested planning helpers directly from tools/plan_word_corpus.py
@@ -56,6 +56,19 @@ class ExtensionSummary:
     target_takes: int = 2
     diphones_2plus_before: int = 0
     diphones_2plus_after: int = 0
+    single_take_before: int = 0
+    single_take_after: int = 0
+
+
+@dataclass
+class ReinforcementPreview:
+    target_takes: int
+    new_words: List[Dict[str, object]]
+    diphones_2plus_before: int
+    diphones_2plus_after: int
+    single_take_before: int
+    single_take_after: int
+    est_minutes: int
 
 
 def build_wordlist_from_text(source_path: Path, dest_path: Path, *, ascii_only: bool = False) -> Path:
@@ -123,12 +136,17 @@ def generate_plan(
         from .downloader import CancelledError
         raise CancelledError("Plan generation cancelled.")
 
+    # 1b. Resolve on-demand Hunspell dictionary for language authenticity filtering
+    dict_path = ensure_dictionary(lang, catalog=cat, progress=progress, cancel=cancel)
+    en_wl_fallback = get_wordlists_cache_dir() / "en_50k.txt"
+
     if progress:
         progress(f"Scanning vocabulary with eSpeak NG ({lang.espeak_voice})...", 0.25)
 
     # 2. Run tools/plan_word_corpus.py cleanly as a subprocess (zero stdout/global side effects)
     compare_voice = project.config.compare_voice or "none"
     skip_symbols = ",".join(project.config.skip_symbols) if project.config.skip_symbols else "none"
+    supp_mode = "real-gaps" if getattr(project.config, "include_supplements", True) else "none"
 
     cmd = [
         *tool_subprocess_cmd("plan_word_corpus"),
@@ -137,12 +155,18 @@ def generate_plan(
         "--skip-symbols", skip_symbols,
         "--wordlist", str(wl_path),
         "--out-dir", str(project.plan_dir),
-        "--max-words", str(project.config.max_words),
+        "--max-words", str(int(getattr(project.config, "max_words", 0) or 0)),
         "--min-takes", str(getattr(project.config, "min_takes", 1)),
-        "--supplement-mode", project.config.supplement_mode,
+        "--supplement-mode", supp_mode,
         "--espeak-bin", str(espeak_bin),
         "--espeak-data", str(espeak_data),
     ]
+    if dict_path is not None and dict_path.is_file():
+        cmd.extend(["--dict-file", str(dict_path)])
+    elif not lang.espeak_voice.lower().startswith("en") and en_wl_fallback.is_file():
+        cmd.extend(["--english-wordlist", str(en_wl_fallback)])
+    if not getattr(project.config, "merge_duplicate_vowels", True):
+        cmd.append("--no-merge-ipa-dups")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     res = subprocess.run(
         cmd,
@@ -203,27 +227,22 @@ def generate_plan(
     )
 
 
-def extend_project_plan(
+def compute_reinforcement_pass(
     project: VoiceProject,
     *,
-    extra_words: int = 200,
+    extra_words: int = 0,
     min_takes: int = 2,
     catalog: Optional[LanguageCatalog] = None,
     progress: Optional[ProgressFn] = None,
     cancel: Optional[CancelFn] = None,
-) -> ExtensionSummary:
-    """Append additional real words to an existing plan without altering existing line numbers.
-
-    Generates a standalone extension recording script in `recordings/pickups/ext_XX_script.txt`
-    and registers an unapplied batch in `project.json` so the user can record ONLY the new
-    words and import them cleanly via `apply_pickup_recording` (or Built-in Mic Studio).
-    """
+) -> ReinforcementPreview:
+    """Calculate the exact words needed to reinforce the lowest-take core pairs without modifying the plan."""
     dmap_path = project.plan_dir / "diphone_map.json"
     if not dmap_path.is_file():
         raise FileNotFoundError(f"Generate an initial plan first (missing {dmap_path}).")
 
     if progress:
-        progress("Resolving language and word list for extension...", 0.08)
+        progress("Analyzing current diphone take counts...", 0.10)
 
     cat = catalog or LanguageCatalog()
     lang = project.language_spec(cat)
@@ -244,9 +263,12 @@ def extend_project_plan(
             ascii_only=lang.ascii_only,
         )
 
+    dict_path = ensure_dictionary(lang, catalog=cat, progress=progress, cancel=cancel)
+    en_wl_fallback = get_wordlists_cache_dir() / "en_50k.txt"
+
     if cancel and cancel():
         from .downloader import CancelledError
-        raise CancelledError("Corpus extension cancelled.")
+        raise CancelledError("Reinforcement calculation cancelled.")
 
     dmap = json.loads(dmap_path.read_text(encoding="utf-8"))
     inv_path = project.plan_dir / "inventory.json"
@@ -262,10 +284,11 @@ def extend_project_plan(
         for a, b in zip(phs, phs[1:]):
             dp_counts_before[f"{a}_{b}"] += 1
     diphones_2plus_before = sum(1 for c in dp_counts_before.values() if c >= 2)
+    single_take_before = sum(1 for c in dp_counts_before.values() if c == 1)
 
     target_takes = max(2, int(min_takes))
     if progress:
-        progress(f"Selecting up to {extra_words} additional real words (target {target_takes}+ takes/pair)...", 0.35)
+        progress(f"Calculating reinforcement words targeting {target_takes}+ takes for lowest-take core pairs...", 0.35)
 
     ext_tmp = project.plan_dir / "_extend_tmp"
     compare_voice = project.config.compare_voice or "none"
@@ -283,12 +306,16 @@ def extend_project_plan(
             "--wordlist", str(wl_path),
             "--out-dir", str(ext_tmp),
             "--extend-from", str(project.plan_dir),
-            "--max-words", str(extra_words),
+            "--max-words", str(int(extra_words or 0)),
             "--min-takes", str(k_takes),
-            "--supplement-mode", project.config.supplement_mode,
+            "--supplement-mode", "none",
             "--espeak-bin", str(espeak_bin),
             "--espeak-data", str(espeak_data),
         ]
+        if dict_path is not None and dict_path.is_file():
+            cmd.extend(["--dict-file", str(dict_path)])
+        elif not lang.espeak_voice.lower().startswith("en") and en_wl_fallback.is_file():
+            cmd.extend(["--english-wordlist", str(en_wl_fallback)])
         res = subprocess.run(
             cmd,
             capture_output=True,
@@ -298,50 +325,68 @@ def extend_project_plan(
             creationflags=creationflags,
         )
         if res.returncode != 0:
-            raise RuntimeError(f"Corpus extension planner failed:\n{res.stdout}\n{res.stderr}")
+            raise RuntimeError(f"Reinforcement planner failed:\n{res.stdout}\n{res.stderr}")
         ext_dmap = json.loads((ext_tmp / "diphone_map.json").read_text(encoding="utf-8"))
         words = [dict(it) for it in ext_dmap.get("lines", []) if it.get("kind") == "word"]
-        # Guard: only accept words whose phones all exist in the project's locked inventory
         if allowed_phones is not None:
             words = [w for w in words if all(p in allowed_phones for p in w.get("phones", []))]
         return words
 
     try:
         new_words = _run_extend(target_takes)
-        # If corpus already satisfied target_takes everywhere (e.g. started as a 2x project),
-        # automatically escalate to target_takes + 1 so extending still works!
-        if not new_words and target_takes < 4:
+        while not new_words and target_takes < 4:
             target_takes += 1
             if progress:
-                progress(f"Corpus already meets previous redundancy; escalating to {target_takes}+ takes/pair...", 0.55)
+                progress(f"Core pairs already meet {target_takes - 1}x takes; calculating {target_takes}x pass...", 0.60)
             new_words = _run_extend(target_takes)
     finally:
         shutil.rmtree(ext_tmp, ignore_errors=True)
 
     if not new_words:
-        raise RuntimeError("No additional words were needed (all target diphones already meet the redundancy goal).")
-
-    if progress:
-        progress(f"Appending {len(new_words)} new word(s) to project plan...", 0.80)
-
-    first_line = max((int(x["line"]) for x in existing_lines), default=0) + 1
+        raise RuntimeError("No additional words are needed — core sound pairs already meet the redundancy goal.")
 
     dp_counts_after = collections.Counter(dp_counts_before)
+    for item in new_words:
+        phs = list(item.get("phones", []))
+        for a, b in zip(phs, phs[1:]):
+            dp_counts_after[f"{a}_{b}"] += 1
+    diphones_2plus_after = sum(1 for c in dp_counts_after.values() if c >= 2)
+    single_take_after = sum(1 for c in dp_counts_after.values() if c == 1)
+    est_min = max(1, int(round(len(new_words) * 2.0 / 60.0)))
+
+    if progress:
+        progress(f"Calculated {len(new_words)} reinforcement words (~{est_min} min recording).", 1.0)
+
+    return ReinforcementPreview(
+        target_takes=target_takes,
+        new_words=new_words,
+        diphones_2plus_before=diphones_2plus_before,
+        diphones_2plus_after=diphones_2plus_after,
+        single_take_before=single_take_before,
+        single_take_after=single_take_after,
+        est_minutes=est_min,
+    )
+
+
+def apply_reinforcement_pass(project: VoiceProject, preview: ReinforcementPreview) -> ExtensionSummary:
+    """Commit a computed `ReinforcementPreview` onto `project`'s plan without altering earlier lines."""
+    dmap_path = project.plan_dir / "diphone_map.json"
+    dmap = json.loads(dmap_path.read_text(encoding="utf-8"))
+    existing_lines: List[Dict[str, object]] = list(dmap.get("lines", []))
+    first_line = max((int(x["line"]) for x in existing_lines), default=0) + 1
+
     appended_lines: List[int] = []
     appended_script_rows: List[str] = []
-    for offset, item in enumerate(new_words):
+    for offset, raw_item in enumerate(preview.new_words):
+        item = dict(raw_item)
         ln = first_line + offset
         item["line"] = ln
         existing_lines.append(item)
         appended_lines.append(ln)
         appended_script_rows.append(f"{ln:04d}  {item['text']}")
-        phs = list(item.get("phones", []))
-        for a, b in zip(phs, phs[1:]):
-            dp_counts_after[f"{a}_{b}"] += 1
-    diphones_2plus_after = sum(1 for c in dp_counts_after.values() if c >= 2)
 
     dmap["lines"] = existing_lines
-    dmap["word_count"] = int(dmap.get("word_count", 0)) + len(new_words)
+    dmap["word_count"] = int(dmap.get("word_count", 0)) + len(preview.new_words)
 
     tmp_dmap = dmap_path.with_suffix(".json.tmp")
     tmp_dmap.write_text(json.dumps(dmap, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -354,17 +399,16 @@ def extend_project_plan(
     tmp_script.write_text(combined_txt, encoding="utf-8")
     tmp_script.replace(full_script)
 
-    # Export a clean standalone script for ONLY the newly added extension words
     project.pickups_dir.mkdir(parents=True, exist_ok=True)
     ext_idx = sum(1 for pb in project.config.pickups if str(pb.get("id", "")).startswith("ext_")) + 1
     batch_id = f"ext_{ext_idx:02d}"
     ext_script_lines = [
-        f"# DiphoneForge Corpus Extension — {batch_id} ({len(new_words)} new words: lines {first_line}-{appended_lines[-1]})",
+        f"# DiphoneForge Reinforcement Pass — {batch_id} ({len(preview.new_words)} new words: lines {first_line}-{appended_lines[-1]})",
         "# Record ONLY these new words in order with a brief pause (~0.5 s) between each word.",
         "# Your earlier recordings and alignments remain completely untouched.",
         "",
     ]
-    for idx, (ln, item) in enumerate(zip(appended_lines, new_words), 1):
+    for idx, (ln, item) in enumerate(zip(appended_lines, preview.new_words), 1):
         ext_script_lines.append(f"{idx:03d}  (Line {ln:04d})  {item['text']}")
     ext_script_path = project.pickups_dir / f"{batch_id}_script.txt"
     ext_script_path.write_text("\n".join(ext_script_lines) + "\n", encoding="utf-8")
@@ -382,22 +426,38 @@ def extend_project_plan(
     project.config.pickups.append(meta_doc)
     project.save()
 
-    if progress:
-        progress(
-            f"Extended corpus by {len(new_words)} words (lines {first_line}-{appended_lines[-1]}). "
-            f"Script saved to {ext_script_path.name}.",
-            1.0,
-        )
-
     return ExtensionSummary(
         batch_id=batch_id,
-        added_words=len(new_words),
+        added_words=len(preview.new_words),
         first_line=first_line,
         last_line=appended_lines[-1],
         total_prompts=len(existing_lines),
         script_path=ext_script_path,
         lines=appended_lines,
-        target_takes=target_takes,
-        diphones_2plus_before=diphones_2plus_before,
-        diphones_2plus_after=diphones_2plus_after,
+        target_takes=preview.target_takes,
+        diphones_2plus_before=preview.diphones_2plus_before,
+        diphones_2plus_after=preview.diphones_2plus_after,
+        single_take_before=preview.single_take_before,
+        single_take_after=preview.single_take_after,
     )
+
+
+def extend_project_plan(
+    project: VoiceProject,
+    *,
+    extra_words: int = 0,
+    min_takes: int = 2,
+    catalog: Optional[LanguageCatalog] = None,
+    progress: Optional[ProgressFn] = None,
+    cancel: Optional[CancelFn] = None,
+) -> ExtensionSummary:
+    """Auto-calculate and append a reinforcement pass to an existing plan without altering earlier lines."""
+    preview = compute_reinforcement_pass(
+        project,
+        extra_words=extra_words,
+        min_takes=min_takes,
+        catalog=catalog,
+        progress=progress,
+        cancel=cancel,
+    )
+    return apply_reinforcement_pass(project, preview)

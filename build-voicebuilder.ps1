@@ -101,6 +101,7 @@ $PyArgs = @(
     "--hidden-import", "build_word_mbrola_db",
     "--hidden-import", "resegment_from_whole_alignment",
     "--hidden-import", "smoke_mbrola_host",
+    "--hidden-import", "voicebuilder.dictionary",
     "--collect-all", "_sounddevice_data",
     "--collect-all", "_soundfile_data",
     "--exclude-module", "tkinter",

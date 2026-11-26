@@ -177,21 +177,22 @@ def make_distance_fn(vowel_set: set[str], ipa_map: Dict[str, str]):
     return dist
 
 
-def estimate_f0_frames(seg: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 320.0) -> List[float]:
-    """Pure-NumPy normalized autocorrelation F0 estimator (zero librosa/numba overhead)."""
+def estimate_f0_and_clarity(seg: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 320.0) -> Tuple[List[float], List[float]]:
+    """Pure-NumPy normalized autocorrelation F0 & harmonic periodicity estimator."""
     win_n = int(sr * 0.040)
     hop_n = int(sr * 0.010)
     if len(seg) < win_n:
-        return []
+        return [], []
     lag_min = max(1, int(sr / fmax))
     lag_max = min(win_n - 2, int(sr / fmin))
     if lag_max <= lag_min:
-        return []
+        return [], []
     seg64 = seg.astype(np.float64)
     ref_rms = float(np.sqrt(np.mean(seg64 ** 2)))
     if ref_rms < 1e-5:
-        return []
-    out: List[float] = []
+        return [], []
+    out_f0: List[float] = []
+    out_corr: List[float] = []
     nfft = 1 << (2 * win_n - 1).bit_length()
     for pos in range(0, len(seg64) - win_n + 1, hop_n):
         frame = seg64[pos:pos + win_n]
@@ -206,8 +207,14 @@ def estimate_f0_frames(seg: np.ndarray, sr: int, fmin: float = 65.0, fmax: float
         sub = ac[lag_min:lag_max + 1]
         best = int(np.argmax(sub))
         if sub[best] > 0.55:
-            out.append(sr / float(lag_min + best))
-    return out
+            out_f0.append(sr / float(lag_min + best))
+            out_corr.append(float(sub[best]))
+    return out_f0, out_corr
+
+
+def estimate_f0_frames(seg: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 320.0) -> List[float]:
+    """Pure-NumPy normalized autocorrelation F0 estimator (zero librosa/numba overhead)."""
+    return estimate_f0_and_clarity(seg, sr, fmin=fmin, fmax=fmax)[0]
 
 
 def db_level(arr: np.ndarray) -> float:
@@ -305,8 +312,51 @@ def build_unit_grid(
     audio_dir: Path,
     vowels: set[str],
     out_csv: Path,
+    *,
+    ipa_map: Optional[Dict[str, str]] = None,
+    flagged_lines: Optional[set[int]] = None,
+    excluded_lines: Optional[set[int]] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, float]]:
-    """Extract all diphone candidates from Pass-2 TextGrids and estimate speaker F0."""
+    """Extract all diphone candidates from Pass-2 TextGrids, estimate speaker F0, and score takes."""
+    imap = ipa_map or {}
+    flagged_set = set(flagged_lines or ())
+    excluded_set = set(excluded_lines or ())
+
+    def _phone_is_voiced(ph: str) -> bool:
+        if ph in vowels:
+            return True
+        feat = ipa_features(imap.get(ph, ph), False)
+        return feat[2] >= 0.5
+
+    def _phone_is_stop_or_flap(ph: str) -> bool:
+        if ph in vowels:
+            return False
+        ip = imap.get(ph, ph).strip()
+        if ip in ("ɾ", "ʔ"):
+            return True
+        feat = ipa_features(ip, False)
+        return feat[1] <= 1.5  # manner 1 = stop
+
+    def _midpoint_drop_db(src_mono: np.ndarray, sr: int, ps_abs: float, pe_abs: float) -> float:
+        """Measure how many dB the 20 ms midpoint energy drops below the phone's peak 20 ms energy."""
+        i0 = max(0, int(round(ps_abs * sr)))
+        i1 = min(len(src_mono), int(round(pe_abs * sr)))
+        if i1 - i0 < max(8, int(sr * 0.025)):
+            return 0.0
+        seg = src_mono[i0:i1]
+        win = max(8, int(sr * 0.020))
+        hop = max(4, int(sr * 0.005))
+        if len(seg) < win:
+            return 0.0
+        mid_c = len(seg) // 2
+        m0 = max(0, mid_c - win // 2)
+        mid_db = db_level(seg[m0 : m0 + win])
+        cs = np.concatenate(([0.0], np.cumsum(seg.astype(np.float64) ** 2)))
+        idx = np.arange(0, len(seg) - win + 1, hop)
+        frm_rms = np.sqrt(np.maximum(0.0, (cs[idx + win] - cs[idx]) / win))
+        peak_db = float(20.0 * math.log10(max(float(np.max(frm_rms)), 1e-12)))
+        return max(0.0, peak_db - mid_db)
+
     # Preload source audio once (mono 44.1 kHz) for fast SNR/RMS/F0 diagnostics
     src_cache: Dict[str, Tuple[np.ndarray, int]] = {}
     for seg in segments.values():
@@ -320,6 +370,9 @@ def build_unit_grid(
     skipped = 0
 
     for ln in sorted(segments):
+        if ln in excluded_set:
+            skipped += 1
+            continue
         seg = segments[ln]
         tg_path = aligned_dir / f"line_{ln:04d}.TextGrid"
         if not tg_path.exists():
@@ -378,6 +431,8 @@ def build_unit_grid(
                 i1 = min(len(src_mono), int((src_start + pe) * sr))
                 corpus_vowel_f0.extend(estimate_f0_frames(src_mono[i0:i1], sr))
 
+        is_flagged = int(ln in flagged_set)
+
         # Extract every consecutive diphone pair in this word/supplement
         for i in range(n_ph - 1):
             p1, p1_s, p1_e = canon[i]
@@ -394,9 +449,25 @@ def build_unit_grid(
             rms_db = db_level(seg_audio)
             peak = float(np.max(np.abs(seg_audio))) if len(seg_audio) else 0.0
             snr_db = rms_db - noise_db
-            f0s = estimate_f0_frames(seg_audio, sr)
+
+            # Only estimate F0 & harmonic periodicity on voiced portions (prevents spurious 320 Hz peaks on voiceless clusters)
+            v1, v2 = _phone_is_voiced(p1), _phone_is_voiced(p2)
+            f0s: List[float] = []
+            corrs: List[float] = []
+            if v1 and v2:
+                f0s, corrs = estimate_f0_and_clarity(seg_audio, sr)
+            elif v1 and (p1_e - mid1) >= 0.035:
+                f0s, corrs = estimate_f0_and_clarity(src_mono[max(0, int((src_start + p1_s) * sr)) : min(len(src_mono), int((src_start + p1_e) * sr))], sr)
+            elif v2 and (mid2 - p2_s) >= 0.035:
+                f0s, corrs = estimate_f0_and_clarity(src_mono[max(0, int((src_start + p2_s) * sr)) : min(len(src_mono), int((src_start + p2_e) * sr))], sr)
             f0_med = float(np.median(f0s)) if f0s else 0.0
             f0_std = float(np.std(f0s)) if len(f0s) >= 2 else 0.0
+            voicing_corr = float(np.median(corrs)) if corrs else 0.0
+
+            # Midpoint energy stability check on vowels/voiced sonorants
+            drop1 = _midpoint_drop_db(src_mono, sr, src_start + p1_s, src_start + p1_e) if (p1 in vowels or (v1 and not _phone_is_stop_or_flap(p1))) else 0.0
+            drop2 = _midpoint_drop_db(src_mono, sr, src_start + p2_s, src_start + p2_e) if (p2 in vowels or (v2 and not _phone_is_stop_or_flap(p2))) else 0.0
+            mid_drop_db = max(drop1, drop2)
 
             is_stressed = int((i < len(stresses) and stresses[i] == 1) or (i + 1 < len(stresses) and stresses[i + 1] == 1))
             is_medial = int((0 < i) and (i + 1 < n_ph - 1))
@@ -425,6 +496,9 @@ def build_unit_grid(
                 "peak": round(peak, 5),
                 "f0_median_hz": round(f0_med, 2),
                 "f0_std_hz": round(f0_std, 2),
+                "voicing_corr": round(voicing_corr, 3),
+                "mid_drop_db": round(mid_drop_db, 2),
+                "is_flagged": is_flagged,
                 "is_stressed": is_stressed,
                 "is_medial": is_medial,
                 "is_final": is_final,
@@ -439,88 +513,136 @@ def build_unit_grid(
         "voiced_frames": len(corpus_vowel_f0),
     }
 
-    # Score every candidate take using a balanced, neutral-voice acoustic formula:
-    #   1. Clean SNR floor + clipping guard (saturates at 28 dB)
-    #   2. Natural conversational loudness centered on corpus median RMS (penalizing
-    #      BOTH whispered/fading tails AND shouted/emphasized spikes)
-    #   3. Anti-reduction steady-state duration clarity (saturates cleanly at 120 ms)
-    #   4. Natural unemphasized speaking pitch near speaker's neutral median F0
-    #      (penalizes creaky drops AND strongly accented high-pitch syllables that
-    #      cause vocoder artifacts when synthesized at neutral pitch)
-    #   5. Gentle stress & word-familiarity tie-breakers
-    med_rms = statistics.median(float(r["rms_db"]) for r in rows)
+    # Phone-class RMS medians so consonant-consonant diphones aren't penalized for being quieter than vowels
+    def _rms_class(r: Dict[str, object]) -> str:
+        p1, p2 = str(r["phone1"]), str(r["phone2"])
+        if p1 in vowels or p2 in vowels:
+            return "vowel"
+        if _phone_is_voiced(p1) or _phone_is_voiced(p2):
+            return "voiced_cons"
+        return "voiceless_cons"
+
+    class_rms: Dict[str, List[float]] = collections.defaultdict(list)
+    for r in rows:
+        class_rms[_rms_class(r)].append(float(r["rms_db"]))
+    med_rms_global = statistics.median(float(r["rms_db"]) for r in rows)
+    med_rms_by_class = {k: statistics.median(v) for k, v in class_rms.items() if v}
     spk_f0 = f0_stats["median_hz"]
 
+    def _phone_dur_score(ph: str, dur: float) -> float:
+        if _phone_is_stop_or_flap(ph):
+            # Stops/flaps: reward clean release (45-240 ms); don't penalize clear citation stops up to 420 ms
+            if dur < 0.022:
+                return -1.2
+            if dur < 0.045:
+                return 0.10
+            if dur <= 0.240:
+                return 0.55 * min(1.0, (dur - 0.035) / 0.115)
+            if dur <= 0.420:
+                return 0.45
+            return -min(1.5, 0.40 + (dur - 0.420) * 3.0)
+        if ph in vowels:
+            # Vowels: reward full, unreduced steady-state clarity (90-320 ms) without punishing citation finals
+            if dur < 0.038:
+                return -1.6
+            if dur < 0.060:
+                return -0.6
+            if dur <= 0.320:
+                return 0.75 * min(1.0, (dur - 0.055) / 0.130)
+            if dur <= 0.450:
+                return 0.55
+            return -min(1.5, 0.45 + (dur - 0.450) * 3.0)
+        # Fricatives, nasals, liquids, glides
+        if dur < 0.028:
+            return -1.2
+        if dur < 0.048:
+            return -0.3
+        if dur <= 0.300:
+            return 0.65 * min(1.0, (dur - 0.045) / 0.120)
+        if dur <= 0.440:
+            return 0.45
+        return -min(1.5, 0.45 + (dur - 0.440) * 3.0)
+
     for r in rows:
+        p1, p2 = str(r["phone1"]), str(r["phone2"])
         snr = float(r["snr_db"])
         d1 = float(r["phone1_duration_s"])
         d2 = float(r["phone2_duration_s"])
-        min_d = min(d1, d2)
-        max_d = max(d1, d2)
         peak = float(r["peak"])
         rms = float(r["rms_db"])
         f0_med = float(r["f0_median_hz"])
         f0_std = float(r["f0_std_hz"])
+        v_corr = float(r.get("voicing_corr", 0.0))
+        mid_drop = float(r["mid_drop_db"])
+        r_cls = _rms_class(r)
+        ref_rms = med_rms_by_class.get(r_cls, med_rms_global)
 
         score = 0.0
 
-        # 1. Clean SNR floor + clipping guard
-        if snr < 18.0:
-            score -= 2.0 * (18.0 - snr) / 6.0
+        # 0. Audit-flagged lines strongly penalized so clean alternate takes always win
+        if int(r["is_flagged"]):
+            score -= 2.5
+
+        # 1. Clean SNR floor + clipping guard (saturates at 24 dB so extra loudness doesn't beat clarity)
+        snr_floor = 12.0 if r_cls == "voiceless_cons" else 17.0
+        if snr < snr_floor:
+            score -= 1.8 * (snr_floor - snr) / 6.0
         else:
-            score += 0.60 * min(1.0, (snr - 18.0) / 10.0)
-        if peak > 0.92:
+            score += 0.45 * min(1.0, (snr - snr_floor) / 7.0)
+        if peak > 0.94:
             score -= 3.0
 
-        # 2. Natural conversational loudness (penalize whispered drops & shouted spikes)
-        rms_diff = rms - med_rms
-        if rms_diff < -3.5:
-            score -= min(1.4, 0.20 * (-3.5 - rms_diff))
-        elif rms_diff > 5.0:
-            score -= min(0.9, 0.16 * (rms_diff - 5.0))
+        # 2. Natural conversational loudness centered on phone-class median RMS
+        rms_diff = rms - ref_rms
+        if rms_diff < -5.5:
+            score -= min(1.3, 0.18 * (-5.5 - rms_diff))
+        elif rms_diff > 4.0:
+            score -= min(1.0, 0.20 * (rms_diff - 4.0))
         else:
-            score += 0.30
+            score += 0.25
 
-        # 3. Anti-reduction & steady-state duration clarity (saturates cleanly at 120 ms)
-        if min_d < 0.030:
-            score -= 2.0
-        elif min_d < 0.048:
-            score -= 0.9
-        elif min_d < 0.060:
-            score -= 0.3
+        # 3. Clear, unreduced articulation duration (calibrated from real human listening overrides)
+        score += _phone_dur_score(p1, d1) + _phone_dur_score(p2, d2)
 
-        dur_r1 = min(1.0, max(0.0, (d1 - 0.050) / 0.070))
-        dur_r2 = min(1.0, max(0.0, (d2 - 0.050) / 0.070))
-        score += 0.50 * (dur_r1 + dur_r2)
-        if max_d > 0.360:
-            score -= 0.5
+        # 4. Midpoint energy stability (penalizes misaligned cuts landing in silence/dropouts)
+        if mid_drop > 16.0:
+            score -= min(1.5, 0.11 * (mid_drop - 16.0))
 
-        # 4. Natural unemphasized speaking pitch & steadiness (normalized by speaker F0)
+        # 5. Relaxed neutral speaking pitch & harmonic periodicity (voiced pairs only)
         if f0_med > 0:
             ratio = f0_med / spk_f0
-            if ratio < 0.85:
-                score -= 0.7  # creaky drop
-            elif ratio > 1.32:
-                # Emphasized/accented high pitch (sounds vocoded when pitched back down)
-                score -= min(1.0, 0.65 * (ratio - 1.32) / 0.20 + 0.25)
-            elif 0.92 <= ratio <= 1.22:
-                score += 0.35  # relaxed conversational speaking pitch
+            if ratio < 0.80:
+                score -= 0.75  # creaky drop
+            elif ratio <= 1.14:
+                score += 0.45  # relaxed conversational speaking pitch
+            elif ratio <= 1.20:
+                score += 0.15
+            else:
+                # High citation-form emphasis (sounds vocoded when MBROLA pitches back down)
+                score -= min(1.3, 0.80 * (ratio - 1.20) / 0.18 + 0.15)
 
             rel_std = f0_std / spk_f0
             if rel_std > 0.03:
-                score -= min(0.8, 0.65 * (rel_std - 0.03) / 0.06)
+                score -= min(0.85, 0.70 * (rel_std - 0.03) / 0.06)
 
-        # 5. Gentle stress & familiarity tie-breakers
-        if r["is_stressed"]:
-            score += 0.12
+            # Mild harmonic-clarity reward for clean periodic voicing (resynthesizes cleanly in MBE)
+            if v_corr >= 0.80:
+                score += 0.20 * min(1.0, (v_corr - 0.80) / 0.15)
+            elif 0.0 < v_corr < 0.65:
+                score -= 0.20
+
+        # 6. No harsh medial/final bias (let actual acoustics & duration decide); gentle stress/familiarity tie-breakers
+        if int(r["is_stressed"]):
+            score += 0.10
+
         if r["kind"] == "word":
             rank = int(r.get("vocab_rank", 99999))
             if rank <= 5000:
-                score += 0.15
+                score += 0.10
             elif rank > 15000:
-                score -= 0.20
+                score -= 0.15
         else:
-            score -= 0.30
+            score -= 0.35
 
         r["score"] = round(score, 4)
 
@@ -1150,6 +1272,238 @@ def validate_db(
     return results
 
 
+def _find_preview_engine_for_probe() -> Optional[Path]:
+    candidates = [
+        PROJECT_ROOT / "engine",
+        PROJECT_ROOT / "build" / "stage" / "synthDrivers",
+        PROJECT_ROOT / "addon" / "synthDrivers",
+    ]
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        candidates.append(Path(appdata) / "nvda" / "addons" / "espeakWitMbrola" / "synthDrivers")
+    for cand in candidates:
+        if (
+            (cand / "espeakMbrolaHost.exe").is_file()
+            and (cand / "espeak.dll").is_file()
+            and (cand / "mbrola.dll").is_file()
+            and (cand / "espeak-ng-data").is_dir()
+        ):
+            return cand
+    return None
+
+
+def _probe_pho_vowel_stats(
+    eng_dir: Path,
+    voice_id: str,
+    text: str,
+) -> Tuple[float, float, int, int]:
+    """Run one fast 175 wpm probe via espeakMbrolaHost.exe and return `(v_med_ms, c_med_ms, n_v, n_c)`."""
+    env = os.environ.copy()
+    env["ESPEAK_MB_DUMP_PHO"] = "1"
+    bp = eng_dir / "host_base.pho"
+    if bp.exists():
+        try:
+            bp.unlink()
+        except OSError:
+            pass
+    hidden_kw: Dict[str, object] = {}
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        hidden_kw["startupinfo"] = si
+        hidden_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    proc = subprocess.Popen(
+        [str(eng_dir / "espeakMbrolaHost.exe"), str(eng_dir)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        **hidden_kw,
+    )
+    hdr = struct.Struct("<IIII")
+    magic = 0x484B544D
+
+    def _send(mt: int, gen: int = 0, pl: bytes = b"") -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(hdr.pack(magic, mt, gen, len(pl)) + pl)
+        proc.stdin.flush()
+
+    def _recv() -> Optional[Tuple[int, int, bytes]]:
+        assert proc.stdout is not None
+        raw_h = proc.stdout.read(16)
+        if not raw_h or len(raw_h) < 16:
+            return None
+        _mg, mt, gen, sz = hdr.unpack(raw_h)
+        pl = proc.stdout.read(sz) if sz else b""
+        return mt, gen, pl
+
+    try:
+        if _recv() is None:  # READY
+            return 0.0, 0.0, 0, 0
+        _send(11, 1, voice_id.encode("utf-8"))
+        _recv()  # RESPONSE
+        _send(10, 0, struct.pack("<ii", 1, 175))
+        _send(13, 2, text.encode("utf-8"))
+        while True:
+            msg = _recv()
+            if msg is None or msg[0] in (3, 4, 5):
+                break
+        _send(0xFFFF, 0, b"")
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        return 0.0, 0.0, 0, 0
+
+    if not bp.is_file():
+        return 0.0, 0.0, 0, 0
+    v_durs: List[int] = []
+    c_durs: List[int] = []
+    for ln in bp.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = ln.split("\t")
+        if len(parts) < 2:
+            continue
+        ph = parts[0].strip()
+        if not ph or ph == "_":
+            continue
+        try:
+            dur = int(parts[1].strip())
+        except ValueError:
+            continue
+        tail = parts[2].strip() if len(parts) >= 3 else ""
+        # eSpeak writes multi-point pitch contours (>= 4 tokens) on vowels; sonorants have at most 2 tokens ("100 95")
+        if len(tail.split()) >= 4:
+            v_durs.append(dur)
+        else:
+            c_durs.append(dur)
+    v_med = float(np.median(v_durs)) if v_durs else 0.0
+    c_med = float(np.median(c_durs)) if c_durs else 0.0
+    return v_med, c_med, len(v_durs), len(c_durs)
+
+
+def calibrate_espeak_stress_length(
+    voice_code: str,
+    phoneme_table: str,
+    lang_lines: Sequence[str],
+    db_path: Path,
+    phtrans_path: Path,
+    rate: int,
+    sample_words: Sequence[str],
+    *,
+    engine_dir: Optional[Path] = None,
+) -> Tuple[Optional[str], Dict[str, float]]:
+    """Measure eSpeak NG's default .pho vowel timing for this language and derive a calibrated `stressLength`.
+
+    eSpeak NG's MBROLA backend under-lengths vowels (~25-32 ms vs 65 ms consonants) in many
+    languages whose voice files lack an explicit `stressLength` directive (including Hungarian,
+    Dutch, German, Spanish, Croatian, Italian). Closed-loop probing fixes this automatically
+    for any language while leaving already-balanced languages untouched.
+    """
+    import tempfile
+
+    def _format_stress(scale: float) -> str:
+        # Preserves natural unstressed -> secondary -> tonic stress rhythm
+        base = (155, 145, 190, 190, 190, 190, 225, 250)
+        vals = [min(650, max(120, int(round(b * scale / 5.0)) * 5)) for b in base]
+        return "stressLength " + " ".join(str(v) for v in vals)
+
+    eng_src = engine_dir or _find_preview_engine_for_probe()
+    words = [str(w).strip() for w in sample_words if str(w).strip()]
+    # Prefer clear real words (3-14 chars) so the probe exercises stressed & unstressed syllables
+    good_words = [w for w in words if 3 <= len(w) <= 14 and w.isalpha()]
+    chosen_words = (good_words[:20] if len(good_words) >= 8 else words[:20])
+    if eng_src is None or not db_path.is_file() or not phtrans_path.is_file() or len(chosen_words) < 4:
+        vc_low = voice_code.lower()
+        if vc_low.startswith("en-us"):
+            return "stressLength 170 135 205 205 0 0 245 275", {"fallback": 1.0}
+        if not vc_low.startswith("en"):
+            return _format_stress(2.10), {"fallback": 1.0}
+        return None, {}
+
+    mid = len(chosen_words) // 2
+    probe_text = " ".join(chosen_words[:mid]) + ", " + " ".join(chosen_words[mid:]) + "."
+    rate_field = f" {rate}" if rate != 16000 else " 16000"
+    lang_block = "\n".join(lang_lines)
+    probe_db_name = db_path.name
+    probe_phtrans_name = phtrans_path.name
+
+    def _write_probe_desc(stage_dir: Path, stress_line: Optional[str]) -> None:
+        desc = (
+            f"name probe\n"
+            f"{lang_block}\n"
+            f"gender male\n"
+            f"\n"
+            f"phonemes {phoneme_table}\n"
+            + (f"{stress_line}\n" if stress_line else "")
+            + f"pitch 90 135\n"
+            f"mbrola {probe_db_name} {probe_phtrans_name}{rate_field}\n"
+        )
+        (stage_dir / "espeak-ng-data" / "voices" / "mb" / "mb-probe").write_text(desc, encoding="utf-8")
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="df_stress_") as td:
+            stage = Path(td) / "eng"
+            stage.mkdir(parents=True, exist_ok=True)
+            for fname in ("espeakMbrolaHost.exe", "espeak.dll", "mbrola.dll", "mbrola.exe", "mbrola_stream.dll"):
+                src_f = eng_src / fname
+                if src_f.is_file():
+                    shutil.copy2(src_f, stage / fname)
+            shutil.copytree(
+                eng_src / "espeak-ng-data",
+                stage / "espeak-ng-data",
+                ignore=shutil.ignore_patterns("mbrola"),
+            )
+            mb_dir = stage / "espeak-ng-data" / "mbrola"
+            mb_dir.mkdir(parents=True, exist_ok=True)
+            (stage / "espeak-ng-data" / "mbrola_ph").mkdir(parents=True, exist_ok=True)
+            (stage / "espeak-ng-data" / "voices" / "mb").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(db_path, mb_dir / probe_db_name)
+            shutil.copy2(phtrans_path, stage / "espeak-ng-data" / "mbrola_ph" / probe_phtrans_name)
+
+            # Pass 1: measure default eSpeak NG .pho timing (no stressLength override)
+            _write_probe_desc(stage, None)
+            v0, c0, nv0, nc0 = _probe_pho_vowel_stats(stage, "mb-probe", probe_text)
+            if v0 <= 0.0 or c0 <= 0.0 or nv0 < 6:
+                return None, {}
+
+            # Target healthy vowel median (~60 ms, or ~0.92x consonant median) at 175 wpm
+            target_v = max(54.0, min(64.0, 0.92 * c0))
+            if v0 >= 50.0:
+                return None, {
+                    "default_vowel_ms": round(v0, 1),
+                    "default_cons_ms": round(c0, 1),
+                    "calibrated_vowel_ms": round(v0, 1),
+                    "scale": 1.0,
+                }
+
+            scale = min(2.55, max(1.15, target_v / v0))
+            stress_line = _format_stress(scale)
+
+            # Pass 2: closed-loop verification & one-step refinement if needed
+            _write_probe_desc(stage, stress_line)
+            v1, c1, _, _ = _probe_pho_vowel_stats(stage, "mb-probe", probe_text)
+            if v1 > 0.0 and (v1 < target_v - 8.0 or v1 > target_v + 12.0):
+                scale = min(2.70, max(1.10, scale * (target_v / v1)))
+                stress_line = _format_stress(scale)
+                _write_probe_desc(stage, stress_line)
+                v2, _, _, _ = _probe_pho_vowel_stats(stage, "mb-probe", probe_text)
+                if v2 > 0.0:
+                    v1 = v2
+
+            return stress_line, {
+                "default_vowel_ms": round(v0, 1),
+                "default_cons_ms": round(c0, 1),
+                "calibrated_vowel_ms": round(v1 if v1 > 0 else v0, 1),
+                "scale": round(scale, 2),
+            }
+    except Exception:
+        return None, {}
+
+
 def write_espeak_voice_files(
     inv: Dict[str, object],
     db_name: str,
@@ -1157,20 +1511,32 @@ def write_espeak_voice_files(
     rate: int,
     f0_stats: Dict[str, float],
     out_dir: Path,
+    *,
+    sample_words: Optional[Sequence[str]] = None,
 ) -> None:
     """Write faithful eSpeak NG phtrans binary + voice descriptor from inventory.json."""
     voice_code = str(inv["voice"])
     canonical = set(inv["vowels"]) | set(inv["consonants"])
     norm = dict(inv.get("normalization", {}))
 
-    # Standard split percentages matching stock en1_phtrans
+    # Standard split percentages matching stock en1/us1 phtrans
     splits = {
         "@L": 50,
+        "A@": 65,
+        "O@": 65,
+        "o@": 65,
+        "e@": 65,
+        "i@": 65,
+        "i@3": 65,
+        "U@": 65,
         "aI@": 60,
-        "aI3": 60,
+        "aI3": 70,
         "aU@": 75,
-        "aU3": 75,
+        "aU3": 70,
+        "eI3": 70,
+        "OI3": 70,
     }
+    rhotic_sources = {"A@", "O@", "o@", "e@", "i@", "i@3", "U@", "aI3", "aU3", "eI3", "OI3"}
 
     def pack_name(s: str) -> bytes:
         b = s.encode("ascii")
@@ -1265,6 +1631,11 @@ def write_espeak_voice_files(
         out1 = targets[0] if len(targets) >= 1 else ""
         out2 = targets[1] if len(targets) == 2 else ""
         pct = splits.get(src, 0) if len(targets) == 2 else 0
+        # For rhotic two-phone vowel splits (e.g. A@ -> A: + r), emit conditional records first
+        # so an explicit linking /r/ following the vowel ("car is" -> k A@ r- I z) is not doubled.
+        if len(targets) == 2 and out2 == "r" and src in rhotic_sources:
+            for r_next in ("r", "r-"):
+                records.append((src, r_next, out1, "", 0, 0))
         records.append((src, "", out1, out2, pct, 0))
         seen_src.add(src)
 
@@ -1305,22 +1676,42 @@ def write_espeak_voice_files(
     # In eSpeak NG, the British English phoneme table is named 'en' (not 'en-gb').
     phoneme_table = "en" if voice_code.lower() in ("en-gb", "en-uk") else voice_code
     lang_lines = (
-        "language en-gb 3\nlanguage en-uk 3\nlanguage en 2\n"
+        ["language en-gb 3", "language en-uk 3", "language en 2"]
         if voice_code.lower() in ("en-gb", "en-uk")
-        else f"language {voice_code}\n"
+        else [f"language {voice_code}"]
     )
+    stress_line, cal_stats = calibrate_espeak_stress_length(
+        voice_code,
+        phoneme_table,
+        lang_lines,
+        out_dir / db_name,
+        phtrans_path,
+        rate,
+        sample_words or [],
+    )
+    lang_block = "\n".join(lang_lines)
+    stress_block = f"{stress_line}\n" if stress_line else ""
     desc = (
         f"name {db_name}\n"
-        f"{lang_lines}"
+        f"{lang_block}\n"
         f"gender {gender}\n"
         f"\n"
         f"phonemes {phoneme_table}\n"
+        f"{stress_block}"
         f"pitch {pitch_low} {pitch_high}\n"
         f"mbrola {db_name} {phtrans_name}{rate_field}\n"
     )
     desc_path = out_dir / f"mb-{db_name}"
     desc_path.write_text(desc, encoding="utf-8")
-    print(f"Wrote eSpeak voice files: {phtrans_path} ({len(records)} records) and {desc_path} (pitch {pitch_low}-{pitch_high})")
+    cal_note = ""
+    if stress_line and "default_vowel_ms" in cal_stats:
+        cal_note = (
+            f", calibrated {stress_line} "
+            f"(vowels {cal_stats['default_vowel_ms']}->{cal_stats['calibrated_vowel_ms']} ms vs {cal_stats['default_cons_ms']} ms cons)"
+        )
+    elif stress_line:
+        cal_note = f", {stress_line}"
+    print(f"Wrote eSpeak voice files: {phtrans_path} ({len(records)} records) and {desc_path} (pitch {pitch_low}-{pitch_high}{cal_note})")
 
 
 def main() -> int:
@@ -1337,6 +1728,8 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=max(1, min(8, (os.cpu_count() or 4) - 1)))
     parser.add_argument("--period-override", type=int, default=0, help="Optional manual pitch period override (0 = auto from speaker F0)")
     parser.add_argument("--take-overrides", type=Path, default=None, help="Optional JSON mapping diphone -> pinned line number")
+    parser.add_argument("--audit-json", type=Path, default=None, help="Optional align/audit.json used to penalize flagged lines and exclude user-excluded takes")
+    parser.add_argument("--excluded-lines", default="", help="Optional comma-separated line numbers to exclude from the build")
     args = parser.parse_args()
 
     for tool in (ANAF0, ANAMBE, RESYNTH, DATABASE_BUILD, MBROLA):
@@ -1366,6 +1759,18 @@ def main() -> int:
         (build_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # 1. Build unit grid + estimate speaker F0
+    flagged_lines: set[int] = set()
+    excluded_lines: set[int] = set()
+    if args.audit_json and args.audit_json.is_file():
+        aud = json.loads(args.audit_json.read_text(encoding="utf-8"))
+        dismissed = {int(x) for x in aud.get("dismissed_lines", [])}
+        flagged_lines = {int(f["line"]) for f in aud.get("flags", [])} - dismissed
+        excluded_lines |= {int(x) for x in aud.get("excluded_lines", [])}
+    if args.excluded_lines.strip():
+        for tok in args.excluded_lines.split(","):
+            if tok.strip().isdigit():
+                excluded_lines.add(int(tok.strip()))
+
     rows, f0_stats = build_unit_grid(
         segments=segments,
         token_meta=token_meta,
@@ -1374,6 +1779,9 @@ def main() -> int:
         audio_dir=args.audio_dir,
         vowels=vowel_set,
         out_csv=out_root / "unit_grid.csv",
+        ipa_map=ipa_map,
+        flagged_lines=flagged_lines,
+        excluded_lines=excluded_lines,
     )
 
     # 2. Derive speaker-matched MBE period / frame shift / frame length.
@@ -1499,9 +1907,10 @@ def main() -> int:
     print("Validating all units through mbrola.exe...", flush=True)
     val_results = validate_db(db_path, manifest, out_root, f0_hz=f0_stats["median_hz"])
 
-    # 7. Write faithful eSpeak phtrans & descriptor
+    # 7. Write faithful eSpeak phtrans & descriptor (with auto-calibrated vowel stressLength)
     phtrans_name = args.phtrans_name or f"{args.name}_phtrans"
-    write_espeak_voice_files(inv, args.name, phtrans_name, args.rate, f0_stats, build_dir)
+    sample_words = [str(it["text"]) for it in dmap_doc.get("lines", []) if it.get("kind") == "word"]
+    write_espeak_voice_files(inv, args.name, phtrans_name, args.rate, f0_stats, build_dir, sample_words=sample_words)
 
     # 8. Summary JSON
     summary = {

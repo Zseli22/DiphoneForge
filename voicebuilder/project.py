@@ -49,8 +49,9 @@ class ProjectConfig:
     wordlist_source: str  # "auto" or path to custom wordlist/text file
     rates: List[int] = field(default_factory=lambda: [22050])
     recording_mode: str = "mic"  # "mic" or "external"
-    max_words: int = 500
+    max_words: int = 0  # 0 = auto-calculate optimal count from coverage target
     min_takes: int = 1
+    include_supplements: bool = True
     supplement_mode: str = "real-gaps"
     merge_duplicate_vowels: bool = True
     compare_voice: Optional[str] = None
@@ -66,6 +67,9 @@ class ProjectConfig:
         }
     )
     speaker_f0_hz: Optional[float] = None
+    calibrated_noise_db: Optional[float] = None
+    dismissed_flags: List[int] = field(default_factory=list)
+    excluded_lines: List[int] = field(default_factory=list)
     pickups: List[Dict[str, object]] = field(default_factory=list)
 
 
@@ -172,7 +176,8 @@ class VoiceProject:
         rates: Optional[List[int]] = None,
         wordlist_source: str = "auto",
         recording_mode: str = "mic",
-        max_words: int = 500,
+        max_words: int = 0,
+        include_supplements: bool = True,
         supplement_mode: str = "real-gaps",
         merge_duplicate_vowels: bool = True,
     ) -> "VoiceProject":
@@ -189,6 +194,7 @@ class VoiceProject:
             rates=list(rates or [22050]),
             recording_mode=recording_mode,
             max_words=max_words,
+            include_supplements=include_supplements,
             supplement_mode=supplement_mode,
             merge_duplicate_vowels=merge_duplicate_vowels,
             compare_voice=lang.compare_voice,
@@ -205,7 +211,9 @@ class VoiceProject:
         if not pf.is_file():
             raise FileNotFoundError(f"Not a DiphoneForge project (missing project.json): {root}")
         raw = json.loads(pf.read_text(encoding="utf-8"))
-        cfg = ProjectConfig(**raw)
+        valid_fields = set(ProjectConfig.__dataclass_fields__.keys())
+        filtered = {k: v for k, v in raw.items() if k in valid_fields}
+        cfg = ProjectConfig(**filtered)
         return cls(root, cfg)
 
     def language_spec(self, catalog: Optional[LanguageCatalog] = None) -> LanguageSpec:

@@ -1,14 +1,15 @@
-"""Screen 4 — Build MBROLA Database, Live Speech Preview Sandbox, Export & NVDA Install."""
+"""Screen 4 — Build MBROLA Database, Live Speech Preview Sandbox, Reinforcement Pass & NVDA Install."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import wx
 
 from ..builder import _db_name_for_rate, build_voice_databases, refresh_unit_grid
+from ..planner import ReinforcementPreview, apply_reinforcement_pass, compute_reinforcement_pass
 from ..preview import export_voice_package, install_voice_to_nvda, synthesize_preview
 from ..recorder import play_wav_file, stop_playback
 
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 
 
 class BuildPanel(wx.Panel):
-    """Step 4: Build validated MBROLA DB(s), audition live speech, and export/install to NVDA."""
+    """Step 4: Build validated MBROLA DB(s), audition live speech, reinforce low-take pairs, and export/install."""
 
     def __init__(self, parent: wx.Window, frame: "WizardFrame") -> None:
         super().__init__(parent)
@@ -25,8 +26,8 @@ class BuildPanel(wx.Panel):
 
         root = wx.BoxSizer(wx.VERTICAL)
 
-        # Build box
-        bld_box = wx.StaticBox(self, label="1. Build & Validate MBROLA Voice Database")
+        # 1. Build & Upgrade box
+        bld_box = wx.StaticBox(self, label="1. Build, Refine & Upgrade Voice Bank")
         bs = wx.StaticBoxSizer(bld_box, wx.VERTICAL)
 
         rate_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -45,18 +46,21 @@ class BuildPanel(wx.Panel):
         b_row = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_build = wx.Button(self, label="Buil&d MBROLA Voice Bank")
         self.btn_picker = wx.Button(self, label="Interactive &Take Picker...")
+        self.btn_reinforce = wx.Button(self, label="Add Reinforce&ment Pass (Low-Take Pairs)...")
         self.btn_build.Bind(wx.EVT_BUTTON, self._on_build)
-        self.btn_picker.Bind(wx.EVT_BUTTON, self._on_open_picker)
+        self.btn_picker.Bind(wx.EVT_BUTTON, lambda _e: self._on_open_picker())
+        self.btn_reinforce.Bind(wx.EVT_BUTTON, self._on_reinforce_pass)
         b_row.Add(self.btn_build, 0, wx.RIGHT, 8)
-        b_row.Add(self.btn_picker, 0)
+        b_row.Add(self.btn_picker, 0, wx.RIGHT, 8)
+        b_row.Add(self.btn_reinforce, 0)
         bs.Add(b_row, 0, wx.ALL, 6)
 
-        self.txt_summary = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY, size=(-1, 90))
+        self.txt_summary = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY, size=(-1, 86))
         self.txt_summary.SetName("Voice Build Summary")
         bs.Add(self.txt_summary, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         root.Add(bs, 0, wx.EXPAND | wx.BOTTOM, 8)
 
-        # Live listening sandbox
+        # 2. Live listening sandbox
         prev_box = wx.StaticBox(self, label="2. Live Listening Sandbox (32-bit eSpeak NG + MBROLA Host)")
         ps = wx.StaticBoxSizer(prev_box, wx.VERTICAL)
 
@@ -69,7 +73,7 @@ class BuildPanel(wx.Panel):
         ps.Add(vrow, 0, wx.ALL, 6)
 
         lbl_txt = wx.StaticText(self, label="Test Te&xt to Synthesize:")
-        self.txt_preview = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(-1, 76))
+        self.txt_preview = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(-1, 74))
         self.txt_preview.SetName("Test Text to Synthesize")
         ps.Add(lbl_txt, 0, wx.LEFT | wx.RIGHT, 6)
         ps.Add(self.txt_preview, 1, wx.EXPAND | wx.ALL, 6)
@@ -77,16 +81,18 @@ class BuildPanel(wx.Panel):
         pbtns = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_speak = wx.Button(self, label="&Speak Preview")
         self.btn_stop = wx.Button(self, label="St&op Playback")
+        self.btn_inspect_preview = wx.Button(self, label="Inspect Text in Take &Picker...")
         self.btn_save_wav = wx.Button(self, label="Save Preview &WAV...")
         self.btn_speak.Bind(wx.EVT_BUTTON, self._on_speak)
         self.btn_stop.Bind(wx.EVT_BUTTON, lambda _e: stop_playback())
+        self.btn_inspect_preview.Bind(wx.EVT_BUTTON, self._on_inspect_preview)
         self.btn_save_wav.Bind(wx.EVT_BUTTON, self._on_save_wav)
-        for b in (self.btn_speak, self.btn_stop, self.btn_save_wav):
+        for b in (self.btn_speak, self.btn_stop, self.btn_inspect_preview, self.btn_save_wav):
             pbtns.Add(b, 0, wx.RIGHT, 6)
         ps.Add(pbtns, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         root.Add(ps, 1, wx.EXPAND | wx.BOTTOM, 8)
 
-        # Export / Install
+        # 3. Export / Install
         exp_box = wx.StaticBox(self, label="3. Export or Install into NVDA")
         es = wx.StaticBoxSizer(exp_box, wx.HORIZONTAL)
         self.btn_export = wx.Button(self, label="&Export Standalone Voice Package...")
@@ -110,7 +116,11 @@ class BuildPanel(wx.Panel):
         if not self.txt_preview.GetValue().strip():
             self.txt_preview.SetValue(spec.preview_text or "Hello world. This is a test of my new MBROLA voice.")
         self._refresh_built_voices()
-        self.chk_rate_22k.SetFocus()
+        # Smart initial focus: Build if unbuilt, Speak Preview once built
+        if self._built_db_names():
+            self.btn_speak.SetFocus()
+        else:
+            self.btn_build.SetFocus()
 
     def on_leave(self) -> None:
         stop_playback()
@@ -160,9 +170,12 @@ class BuildPanel(wx.Panel):
             self.choice_voice.SetSelection(0)
 
         has_built = bool(names)
+        has_grid_src = bool(proj and (proj.segments_csv.is_file() or (proj.build_dir / "unit_grid.csv").is_file()))
         for b in (self.btn_speak, self.btn_save_wav, self.btn_export, self.btn_install_nvda):
             b.Enable(has_built)
-        self.btn_picker.Enable(bool(proj and (proj.segments_csv.is_file() or (proj.build_dir / "unit_grid.csv").is_file())))
+        self.btn_picker.Enable(has_grid_src)
+        self.btn_inspect_preview.Enable(has_grid_src)
+        self.btn_reinforce.Enable(bool(proj and (proj.plan_dir / "diphone_map.json").is_file()))
 
         if not has_built or proj is None:
             self.txt_summary.SetValue("No voice built yet. Click 'Build MBROLA Voice Bank' to analyze, pack, and validate.")
@@ -226,7 +239,7 @@ class BuildPanel(wx.Panel):
             return True
         return False
 
-    def _launch_picker_dialog(self) -> None:
+    def _launch_picker_dialog(self, *, initial_phrase: Optional[str] = None) -> None:
         proj = self.frame.project
         if proj is None:
             return
@@ -244,13 +257,15 @@ class BuildPanel(wx.Panel):
             overrides_json=proj.build_dir / "take_overrides.json",
             voice=proj.config.espeak_voice,
             inventory_json=proj.plan_dir / "inventory.json",
+            diphone_map_json=proj.plan_dir / "diphone_map.json",
+            initial_phrase=initial_phrase,
         ) as dlg:
             dlg.CenterOnParent()
             dlg.ShowModal()
             if dlg.changed:
                 self.frame.announce_status("Take overrides saved. Click 'Build MBROLA Voice Bank' to rebuild with your pinned takes.")
 
-    def _on_open_picker(self, _evt: wx.CommandEvent) -> None:
+    def _on_open_picker(self, *, initial_phrase: Optional[str] = None) -> None:
         proj = self.frame.project
         if proj is None:
             return
@@ -258,10 +273,70 @@ class BuildPanel(wx.Panel):
             self.frame.runner.run(
                 "Refresh Diphone Takes",
                 lambda prog, _canc: refresh_unit_grid(proj, progress=prog),
-                on_success=lambda _ug: self._launch_picker_dialog(),
+                on_success=lambda _ug: self._launch_picker_dialog(initial_phrase=initial_phrase),
             )
             return
-        self._launch_picker_dialog()
+        self._launch_picker_dialog(initial_phrase=initial_phrase)
+
+    def _on_inspect_preview(self, _evt: wx.CommandEvent) -> None:
+        phrase = self.txt_preview.GetValue().strip()
+        self._on_open_picker(initial_phrase=phrase if phrase else None)
+
+    def _on_reinforce_pass(self, _evt: wx.CommandEvent) -> None:
+        proj = self.frame.project
+        if proj is None:
+            return
+
+        def _on_preview_ready(preview: ReinforcementPreview) -> None:
+            n_words = len(preview.new_words)
+            msg = (
+                f"Reinforcement pass calculated (targeting {preview.target_takes}+ takes for lowest-take core pairs):\n\n"
+                f"  • New words to append: {n_words} (approx. {preview.est_minutes} min recording)\n"
+                f"  • Single-take pairs: {preview.single_take_before} -> {preview.single_take_after}\n"
+                f"  • Pairs with 2+ takes: {preview.diphones_2plus_before} -> {preview.diphones_2plus_after}\n\n"
+                "Your existing prompts, recordings, and alignments will stay completely untouched.\n"
+                "Append these words to your project now?"
+            )
+            res = wx.MessageBox(msg, "Add Reinforcement Pass", wx.YES_NO | wx.ICON_QUESTION, parent=self)
+            if res != wx.YES:
+                return
+            summary = apply_reinforcement_pass(proj, preview)
+            self.frame.announce_status(
+                f"Added {summary.added_words} reinforcement words (lines {summary.first_line}-{summary.last_line})."
+            )
+            if proj.config.recording_mode == "mic":
+                go_rec = wx.MessageBox(
+                    f"Appended {summary.added_words} new words (lines {summary.first_line}-{summary.last_line}).\n\n"
+                    "Jump straight to Step 2 (Unrecorded Only) to record them now?",
+                    f"Reinforcement Pass Ready ({summary.batch_id})",
+                    wx.YES_NO | wx.ICON_INFORMATION,
+                    parent=self,
+                )
+                if go_rec == wx.YES:
+                    self.frame.go_to_step(2, unrecorded_only=True)
+            else:
+                wx.MessageBox(
+                    f"Appended {summary.added_words} new words (lines {summary.first_line}-{summary.last_line}).\n\n"
+                    f"Standalone recording script saved to:\n{summary.script_path}\n\n"
+                    "Record ONLY those new words on your external recorder, then go to Step 3 and click "
+                    "'Import Pickup / Extension WAV...' (the line range will be pre-filled automatically).",
+                    f"Reinforcement Pass Ready ({summary.batch_id})",
+                    wx.OK | wx.ICON_INFORMATION,
+                    parent=self,
+                )
+
+        self.frame.runner.run(
+            "Calculate Reinforcement Pass",
+            lambda prog, canc: compute_reinforcement_pass(
+                proj,
+                extra_words=0,
+                min_takes=2,
+                catalog=self.frame.catalog,
+                progress=prog,
+                cancel=canc,
+            ),
+            on_success=_on_preview_ready,
+        )
 
     def _on_speak(self, _evt: wx.CommandEvent) -> None:
         proj = self.frame.project

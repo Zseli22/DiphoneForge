@@ -61,6 +61,10 @@ def get_wordlists_cache_dir() -> Path:
     return get_cache_root() / "wordlists"
 
 
+def get_dictionaries_cache_dir() -> Path:
+    return get_cache_root() / "dictionaries"
+
+
 def get_bin_cache_dir() -> Path:
     return get_cache_root() / "bin"
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import collections
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -104,11 +105,13 @@ class TakePickerDialog(wx.Dialog):
         overrides_json: Path,
         voice: str = "en-gb",
         inventory_json: Optional[Path] = None,
+        diphone_map_json: Optional[Path] = None,
+        initial_phrase: Optional[str] = None,
     ) -> None:
         super().__init__(
             parent,
             title="Interactive Diphone Take Picker",
-            size=(940, 620),
+            size=(980, 640),
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
         )
         self.unit_grid_csv = unit_grid_csv
@@ -117,6 +120,17 @@ class TakePickerDialog(wx.Dialog):
         self.overrides_json = overrides_json
         self.voice = voice
         self.inventory = json.loads(inventory_json.read_text(encoding="utf-8")) if (inventory_json and inventory_json.is_file()) else None
+        self._initial_phrase = initial_phrase.strip() if initial_phrase else None
+
+        # Optional corpus running-speech diphone frequencies for "Most used in speech first" sort
+        self.diphone_freq: Dict[str, float] = {}
+        if diphone_map_json and diphone_map_json.is_file():
+            try:
+                dmap_doc = json.loads(diphone_map_json.read_text(encoding="utf-8"))
+                raw_freq = dmap_doc.get("diphone_freq") or {}
+                self.diphone_freq = {str(k): float(v) for k, v in raw_freq.items()}
+            except Exception:
+                pass
 
         self.segments: Dict[int, Dict[str, str]] = {}
         with segments_csv.open("r", encoding="utf-8", newline="") as f:
@@ -130,56 +144,100 @@ class TakePickerDialog(wx.Dialog):
         for dp in self.by_diphone:
             self.by_diphone[dp].sort(key=lambda r: (-float(r["score"]), int(r["line"])))
 
+        # Fallback usage-frequency estimate when diphone_map.json predates diphone_freq
+        if not self.diphone_freq:
+            for dp, takes in self.by_diphone.items():
+                w = 0.0
+                for t in takes:
+                    rk = int(t.get("vocab_rank", 99999) or 99999)
+                    w += 1.0 / math.log2(max(2, rk) + 2.0)
+                self.diphone_freq[dp] = w
+
         self.overrides: Dict[str, int] = {}
         if overrides_json.is_file():
             raw = json.loads(overrides_json.read_text(encoding="utf-8"))
             self.overrides = {str(k): int(v) for k, v in raw.items()}
 
-        # Sort diphones by MOST number of takes first, then alphabetically
-        self.all_diphones: List[str] = sorted(
-            self.by_diphone.keys(),
-            key=lambda dp: (-len(self.by_diphone[dp]), dp),
-        )
-        self.visible_diphones: List[str] = list(self.all_diphones)
+        self.all_diphones: List[str] = list(self.by_diphone.keys())
+        self.visible_diphones: List[str] = []
         self.current_diphone: Optional[str] = None
         self.changed = False
 
         self._build_ui()
-        self._populate_diphones()
+        if self._initial_phrase:
+            self.chk_multi_only.SetValue(False)
+            self.txt_filter.SetValue(self._initial_phrase)
+            self._on_filter_phrase(None)
+        else:
+            # Default: hide 1-take diphones and sort by most used in speech first
+            self.chk_multi_only.SetValue(True)
+            self._on_substring_filter(None)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
 
     def _build_ui(self) -> None:
         root = wx.BoxSizer(wx.VERTICAL)
 
-        # Filter bar
+        # Filter & Sort bar (Row 1: search / phrase / clear)
         flt_row = wx.BoxSizer(wx.HORIZONTAL)
-        lbl_f = wx.StaticText(self, label="&Filter (diphone or word/phrase):")
+        lbl_f = wx.StaticText(self, label="&Filter (type substring, or Enter for phrase):")
         self.txt_filter = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
         self.txt_filter.SetName("Filter by diphone or word")
         self.txt_filter.Bind(wx.EVT_TEXT, self._on_substring_filter)
         self.txt_filter.Bind(wx.EVT_TEXT_ENTER, self._on_filter_phrase)
         btn_phrase = wx.Button(self, label="Filter by Word/P&hrase")
-        btn_multi = wx.CheckBox(self, label="Only 2+ &takes")
         btn_clear = wx.Button(self, label="&Clear")
         btn_phrase.Bind(wx.EVT_BUTTON, self._on_filter_phrase)
-        btn_multi.Bind(wx.EVT_CHECKBOX, self._on_substring_filter)
         btn_clear.Bind(wx.EVT_BUTTON, self._on_clear_filter)
-        self.chk_multi_only = btn_multi
 
         flt_row.Add(lbl_f, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         flt_row.Add(self.txt_filter, 1, wx.RIGHT, 6)
         flt_row.Add(btn_phrase, 0, wx.RIGHT, 8)
-        flt_row.Add(btn_multi, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         flt_row.Add(btn_clear, 0)
-        root.Add(flt_row, 0, wx.EXPAND | wx.ALL, 10)
+        root.Add(flt_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        # Row 2: Sort order, Hide 1-take diphones, Needs review, Auto-play diphone on arrow
+        opt_row = wx.BoxSizer(wx.HORIZONTAL)
+        lbl_sort = wx.StaticText(self, label="S&ort:")
+        self.choice_sort = wx.Choice(
+            self,
+            choices=[
+                "Most used in speech first",
+                "Most takes first",
+                "Worst score first",
+                "Alphabetical",
+            ],
+        )
+        self.choice_sort.SetName("Sort Diphones")
+        self.choice_sort.SetSelection(0)
+        self.choice_sort.Bind(wx.EVT_CHOICE, self._on_substring_filter)
+
+        self.chk_multi_only = wx.CheckBox(self, label="Hide 1-take diphones (2+ &takes)")
+        self.chk_multi_only.SetName("Hide single-take diphones")
+        self.chk_multi_only.Bind(wx.EVT_CHECKBOX, self._on_substring_filter)
+
+        self.chk_needs_review = wx.CheckBox(self, label="Needs re&view")
+        self.chk_needs_review.SetToolTip("Show only low-confidence, low-SNR, or audit-flagged winning takes.")
+        self.chk_needs_review.Bind(wx.EVT_CHECKBOX, self._on_substring_filter)
+
+        self.chk_autoplay = wx.CheckBox(self, label="&Auto-play diphone on arrow")
+        self.chk_autoplay.SetName("Auto-play diphone when arrowing through takes")
+        self.chk_autoplay.SetToolTip("Automatically play each diphone cut as you arrow up/down in the Recorded Takes list.")
+        self.chk_autoplay.SetValue(False)
+
+        opt_row.Add(lbl_sort, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        opt_row.Add(self.choice_sort, 0, wx.RIGHT, 14)
+        opt_row.Add(self.chk_multi_only, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
+        opt_row.Add(self.chk_needs_review, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
+        opt_row.Add(self.chk_autoplay, 0, wx.ALIGN_CENTER_VERTICAL)
+        root.Add(opt_row, 0, wx.EXPAND | wx.ALL, 10)
 
         self.lbl_filter_info = wx.StaticText(self, label="")
         root.Add(self.lbl_filter_info, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
-        # Split pane: Left = Diphones (most takes first), Right = Takes for selected diphone
+        # Split pane: Left = Diphones, Right = Takes for selected diphone
         split_row = wx.BoxSizer(wx.HORIZONTAL)
 
-        left_box = wx.StaticBox(self, label="Diphones (sorted by most takes first)")
+        left_box = wx.StaticBox(self, label="Diphones")
         ls = wx.StaticBoxSizer(left_box, wx.VERTICAL)
         self.list_diphones = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.BORDER_SUNKEN)
         self.list_diphones.SetName("Diphones List")
@@ -206,6 +264,7 @@ class TakePickerDialog(wx.Dialog):
         self.list_takes.InsertColumn(5, "SNR", width=55)
         self.list_takes.InsertColumn(6, "Status", width=75)
         self.list_takes.Bind(wx.EVT_LIST_ITEM_ACTIVATED, lambda _e: self._play_selected_take(diphone_only=False))
+        self.list_takes.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_take_selected)
         rs.Add(self.list_takes, 1, wx.EXPAND | wx.ALL, 6)
 
         tbtns = wx.BoxSizer(wx.HORIZONTAL)
@@ -332,14 +391,39 @@ class TakePickerDialog(wx.Dialog):
         if 0 <= idx < len(self.visible_diphones):
             self._load_takes_for(self.visible_diphones[idx])
 
+    def _on_take_selected(self, _evt: wx.ListEvent) -> None:
+        if self.chk_autoplay.GetValue() and wx.Window.FindFocus() is self.list_takes:
+            wx.CallAfter(self._play_selected_take, diphone_only=True)
+
+    def _sort_diphones(self, dps: List[str]) -> List[str]:
+        mode = self.choice_sort.GetSelection()
+        if mode == 0:  # Most used in speech first
+            return sorted(dps, key=lambda dp: (-self.diphone_freq.get(dp, 0.0), -len(self.by_diphone[dp]), dp))
+        if mode == 1:  # Most takes first
+            return sorted(dps, key=lambda dp: (-len(self.by_diphone[dp]), dp))
+        if mode == 2:  # Worst score first
+            return sorted(dps, key=lambda dp: (float(self._winner_for(dp)[0]["score"]), dp))
+        return sorted(dps)
+
+    def _is_low_confidence(self, dp: str) -> bool:
+        win, _ = self._winner_for(dp)
+        score = float(win.get("score", 0.0))
+        snr = float(win.get("snr_db", 20.0))
+        flagged = int(win.get("is_flagged", 0) or 0)
+        mid_drop = float(win.get("mid_drop_db", 0.0) or 0.0)
+        return flagged == 1 or score < 0.0 or snr < 14.0 or mid_drop > 16.0
+
     def _on_substring_filter(self, _evt) -> None:
         q = self.txt_filter.GetValue().strip().lower()
         multi = self.chk_multi_only.GetValue()
-        self.visible_diphones = [
+        needs_rev = self.chk_needs_review.GetValue()
+        filtered = [
             dp for dp in self.all_diphones
             if (not multi or len(self.by_diphone[dp]) >= 2)
+            and (not needs_rev or self._is_low_confidence(dp))
             and (not q or q in dp.lower() or any(q in t["text"].lower() for t in self.by_diphone[dp]))
         ]
+        self.visible_diphones = self._sort_diphones(filtered)
         self._populate_diphones()
 
     def _on_filter_phrase(self, _evt) -> None:
@@ -363,9 +447,8 @@ class TakePickerDialog(wx.Dialog):
 
     def _on_clear_filter(self, _evt) -> None:
         self.txt_filter.SetValue("")
-        self.chk_multi_only.SetValue(False)
-        self.visible_diphones = list(self.all_diphones)
-        self._populate_diphones()
+        self.chk_needs_review.SetValue(False)
+        self._on_substring_filter(None)
 
     def _play_selected_take(self, *, diphone_only: bool) -> None:
         if not self.current_diphone:

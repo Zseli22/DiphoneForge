@@ -20,7 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -63,6 +63,26 @@ class AlignmentReport:
     phone_ok_lines: int
     flags: List[AuditFlag]
     phone_map_approximate: List[Tuple[str, str, List[str]]]
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ExternalWavInspection:
+    wav_name: str
+    duration_s: float
+    expected_count: int
+    detected_count: int
+    delta: int
+    utterances: List[Tuple[float, float, float]]  # (t0_s, t1_s, top6_db)
+    loose_utterances: List[Tuple[float, float, float]]
+    noise_p10_db: float
+    speech_ref_db: float
+    direct_vad_ok: bool
+    shift_warning: str = ""
+    suspected_line: Optional[int] = None
+    suspected_text: str = ""
+    suspected_time_s: Optional[float] = None
+    status_label: str = ""
 
 
 def parse_line_list(spec: str) -> List[int]:
@@ -151,6 +171,324 @@ def compute_frame_db(mono: np.ndarray, sr: int) -> Tuple[np.ndarray, float]:
     rms = np.sqrt(np.maximum(0.0, (cs[idx + win] - cs[idx]) / win))
     fdb = 20.0 * np.log10(np.maximum(rms, 1e-12))
     return fdb, float(np.percentile(fdb, 10))
+
+
+def detect_spoken_utterances(
+    mono: np.ndarray,
+    sr: int,
+) -> Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]], float, float]:
+    """Detect isolated spoken utterances in a recording via hysteresis energy VAD.
+
+    Returns `(strict_utts, loose_utts, noise_p10_db, speech_ref_db)` where each
+    utterance is `(start_s, end_s, top6_db)`.
+    - `strict_utts` rejects soft breaths, faint headphone bleed, and sharp recorder
+      button clicks so utterance counts match true spoken words cleanly.
+    - `loose_utts` keeps slightly quieter bursts (down to -9.5 dB below median) so
+      Pass-1 fallback never discards a genuinely quiet spoken word.
+    """
+    total_dur = len(mono) / float(sr) if sr > 0 else 0.0
+    if len(mono) < max(1, int(sr * 0.06)):
+        return [], [], -120.0, -120.0
+
+    fdb, noise_p10 = compute_frame_db(mono, sr)
+    above_noise = fdb[fdb > noise_p10 + 12.0]
+    speech_ref = (
+        float(np.percentile(above_noise, 85))
+        if len(above_noise) >= 10
+        else float(np.percentile(fdb, 95))
+    )
+    if speech_ref < noise_p10 + 8.0:
+        return [], [], noise_p10, speech_ref
+
+    core_thresh = max(noise_p10 + 14.0, speech_ref - 12.0)
+    edge_thresh = max(noise_p10 + 8.0, speech_ref - 26.0)
+
+    # 1. Raw core runs (> core_thresh), dropping isolated <=2-frame (20 ms) impulses before merging
+    active = fdb > core_thresh
+    raw: List[List[int]] = []
+    i = 0
+    n_f = len(active)
+    while i < n_f:
+        if active[i]:
+            j = i
+            while j < n_f and active[j]:
+                j += 1
+            if (j - i) >= 3:
+                raw.append([i, j, j - i])
+            i = j
+        else:
+            i += 1
+
+    # 2. Merge word-internal stop closures / geminates separated by <= 0.38 s (38 frames)
+    merged: List[List[int]] = []
+    for s, e, cnt in raw:
+        if merged and (s - merged[-1][1]) <= 38:
+            merged[-1][1] = e
+            merged[-1][2] += cnt
+        else:
+            merged.append([s, e, cnt])
+
+    # 3. Measure sustained top-6-frame speech energy and filter sharp mechanical clicks
+    cands: List[Tuple[int, int, int, float, float]] = []
+    for s, e, cnt in merged:
+        if cnt < 5:
+            continue
+        vals = np.sort(fdb[s:e])
+        top6 = float(np.mean(vals[-min(6, len(vals)):]))
+        pk = float(vals[-1])
+        # Sharp mechanical button/handling clicks have a brief spike with little sustained energy
+        if cnt < 10 and (pk - top6) > 5.0:
+            continue
+        cands.append((s, e, cnt, top6, pk))
+
+    if not cands:
+        return [], [], noise_p10, speech_ref
+
+    med_top6 = float(np.median([c[3] for c in cands]))
+
+    def _is_boundary_click(s: int, e: int, cnt: int, top6: float) -> bool:
+        t0 = s * 0.010
+        t1 = e * 0.010 + 0.020
+        at_edge = (t0 < 0.35) or (t1 > total_dur - 0.35)
+        return at_edge and cnt < 10 and top6 < (med_top6 - 3.0)
+
+    strict_raw = [c for c in cands if c[3] >= med_top6 - 6.5 and not _is_boundary_click(c[0], c[1], c[2], c[3])]
+    loose_raw = [c for c in cands if c[3] >= med_top6 - 9.5 and not _is_boundary_click(c[0], c[1], c[2], c[3])]
+
+    def _expand_edges(items: List[Tuple[int, int, int, float, float]]) -> List[Tuple[float, float, float]]:
+        out: List[Tuple[float, float, float]] = []
+        for k, (s, e, _cnt, top6, _pk) in enumerate(items):
+            left_lim = (items[k - 1][1] + s) // 2 if k > 0 else 0
+            right_lim = (e + items[k + 1][0]) // 2 if k + 1 < len(items) else n_f
+            es = s
+            sil = 0
+            while es > left_lim:
+                if fdb[es - 1] > edge_thresh:
+                    es -= 1
+                    sil = 0
+                else:
+                    sil += 1
+                    if sil >= 4:
+                        break
+                    es -= 1
+            while es < s and fdb[es] <= edge_thresh:
+                es += 1
+
+            ee = e
+            sil = 0
+            while ee < right_lim:
+                if fdb[ee] > edge_thresh:
+                    ee += 1
+                    sil = 0
+                else:
+                    sil += 1
+                    if sil >= 4:
+                        break
+                    ee += 1
+            while ee > e and fdb[ee - 1] <= edge_thresh:
+                ee -= 1
+            out.append((es * 0.010, min(total_dur, ee * 0.010 + 0.020), top6))
+        return out
+
+    return _expand_edges(strict_raw), _expand_edges(loose_raw), noise_p10, speech_ref
+
+
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    if len(a) < 6 or len(a) != len(b):
+        return 0.0
+    sa = float(np.std(a))
+    sb = float(np.std(b))
+    if sa < 1e-6 or sb < 1e-6:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _analyze_utterance_shift(
+    utts: Sequence[Tuple[float, float, float]],
+    line_nos: Sequence[int],
+    line_phone_counts: Dict[int, int],
+    line_texts: Optional[Dict[int, str]] = None,
+) -> Tuple[str, Optional[int], str, Optional[float]]:
+    """Detect whether utterance durations shift out of sync with prompt phone counts.
+
+    Returns `(warning_text, suspected_line, suspected_text, suspected_time_s)`.
+    """
+    m = len(utts)
+    n = len(line_nos)
+    if m < 10 or n < 10:
+        return "", None, "", None
+
+    durs = np.array([e - s for s, e, _ in utts], dtype=np.float64)
+    nph = np.array([max(1, int(line_phone_counts.get(ln, 4))) for ln in line_nos], dtype=np.float64)
+    med_rate = float(np.median(durs) / max(1.0, float(np.median(nph))))
+    exp_durs = 0.12 + 0.85 * med_rate * nph
+    exp_durs *= float(np.median(durs) / max(1e-6, float(np.median(exp_durs))))
+
+    # Fast exact 1-event skip/extra locator when |m - n| == 1
+    if abs(m - n) == 1:
+        k_len = min(m, n)
+        if m == n - 1:
+            # 1 skipped prompt line at index k (0..n-1): utts[:k] <-> lines[:k], utts[k:] <-> lines[k+1:]
+            err_pref = np.abs(durs - exp_durs[:-1])
+            err_suff = np.abs(durs - exp_durs[1:])
+            cs_pref = np.concatenate(([0.0], np.cumsum(err_pref)))
+            cs_suff = np.concatenate((np.cumsum(err_suff[::-1])[::-1], [0.0]))
+            tot = cs_pref + cs_suff  # length n (k = 0..n-1)
+            best_k = int(np.argmin(tot))
+            ln = int(line_nos[best_k])
+            txt = (line_texts or {}).get(ln, "")
+            t_s = utts[min(best_k, m - 1)][0]
+            txt_part = f" ('{txt}')" if txt else ""
+            return (
+                f"Likely 1 skipped word near line {ln}{txt_part} (~{t_s:.1f} s).",
+                ln,
+                txt,
+                t_s,
+            )
+        else:
+            # 1 extra utterance at index k (0..m-1): utts[:k] <-> lines[:k], utts[k+1:] <-> lines[k:]
+            err_pref = np.abs(durs[:-1] - exp_durs)
+            err_suff = np.abs(durs[1:] - exp_durs)
+            cs_pref = np.concatenate(([0.0], np.cumsum(err_pref)))
+            cs_suff = np.concatenate((np.cumsum(err_suff[::-1])[::-1], [0.0]))
+            tot = cs_pref + cs_suff  # length m (k = 0..m-1)
+            best_k = int(np.argmin(tot))
+            ln = int(line_nos[min(best_k, n - 1)])
+            txt = (line_texts or {}).get(ln, "")
+            t_s = utts[best_k][0]
+            txt_part = f" (near '{txt}')" if txt else ""
+            return (
+                f"Likely 1 extra sound/retake around {t_s:.1f} s near line {ln}{txt_part}.",
+                ln,
+                txt,
+                t_s,
+            )
+
+    # Rolling window correlation check (catches cancelling skip+noise when m == n, or locates onset when |m - n| >= 2)
+    win = min(32, max(12, n // 3))
+    step = max(6, win // 3)
+    max_sh = max(2, min(8, abs(m - n) + 2))
+    limit = min(m, n) - win
+    for start in range(0, max(1, limit + 1), step):
+        end = min(min(m, n), start + win)
+        if end - start < 10:
+            continue
+        r0 = _safe_corr(durs[start:end], nph[start:end])
+        best_sh = 0
+        best_r = r0
+        for sh in range(-max_sh, max_sh + 1):
+            if sh == 0:
+                continue
+            b_s, b_e = start + sh, end + sh
+            if b_s < 0 or b_e > n:
+                continue
+            r = _safe_corr(durs[start:end], nph[b_s:b_e])
+            if r > best_r:
+                best_r = r
+                best_sh = sh
+        if best_sh != 0 and best_r >= 0.45 and (best_r - r0) >= 0.30 and r0 < 0.30:
+            ln = int(line_nos[start])
+            txt = (line_texts or {}).get(ln, "")
+            t_s = utts[start][0]
+            kind_note = (
+                "Possible cancelling skip + extra noise"
+                if m == n
+                else f"Alignment shift ({best_sh:+d} lines) detected"
+            )
+            return (
+                f"{kind_note} around line {ln} (~{t_s:.1f} s).",
+                ln,
+                txt,
+                t_s,
+            )
+
+    return "", None, "", None
+
+
+def inspect_external_wav(
+    wav_path: Path,
+    expected_lines: Sequence[int],
+    line_phone_counts: Optional[Dict[int, int]] = None,
+    line_texts: Optional[Dict[int, str]] = None,
+) -> ExternalWavInspection:
+    """Fast pre-flight inspection of an external WAV against its expected prompt line list."""
+    audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+    mono = audio[:, 0] if audio.shape[1] == 1 else audio.mean(axis=1)
+    dur_s = len(mono) / float(sr) if sr > 0 else 0.0
+    strict_utts, loose_utts, noise_p10, speech_ref = detect_spoken_utterances(mono, sr)
+    exp_n = len(expected_lines)
+    det_n = len(strict_utts)
+    delta = det_n - exp_n
+
+    shift_warn = ""
+    susp_line: Optional[int] = None
+    susp_text = ""
+    susp_time: Optional[float] = None
+    if line_phone_counts:
+        shift_warn, susp_line, susp_text, susp_time = _analyze_utterance_shift(
+            strict_utts, expected_lines, line_phone_counts, line_texts
+        )
+
+    direct_ok = (delta == 0) and (exp_n > 0) and (not shift_warn)
+
+    if direct_ok:
+        status_label = f"{det_n} / {exp_n} (Exact match)"
+    elif delta == 0 and shift_warn:
+        status_label = f"{det_n} / {exp_n} (Shift warning — line ~{susp_line})"
+    elif delta < 0:
+        hint = f", skip near line {susp_line}" if susp_line is not None else ""
+        status_label = f"{det_n} / {exp_n} ({delta:+d} fewer{hint})"
+    else:
+        hint = f", extra near line {susp_line}" if susp_line is not None else ""
+        status_label = f"{det_n} / {exp_n} ({delta:+d} extra{hint})"
+
+    return ExternalWavInspection(
+        wav_name=wav_path.name,
+        duration_s=dur_s,
+        expected_count=exp_n,
+        detected_count=det_n,
+        delta=delta,
+        utterances=strict_utts,
+        loose_utterances=loose_utts,
+        noise_p10_db=noise_p10,
+        speech_ref_db=speech_ref,
+        direct_vad_ok=direct_ok,
+        shift_warning=shift_warn,
+        suspected_line=susp_line,
+        suspected_text=susp_text,
+        suspected_time_s=susp_time,
+        status_label=status_label,
+    )
+
+
+def inspect_external_ranges(
+    project: VoiceProject,
+    ranges: Sequence[Tuple[str, int, int]],
+) -> List[ExternalWavInspection]:
+    """Run fast spoken-utterance inspection on every external WAV in `ranges`."""
+    dmap_path = project.plan_dir / "diphone_map.json"
+    phone_counts: Dict[int, int] = {}
+    line_texts: Dict[int, str] = {}
+    if dmap_path.is_file():
+        dmap = json.loads(dmap_path.read_text(encoding="utf-8"))
+        for it in dmap.get("lines", []):
+            ln = int(it["line"])
+            phone_counts[ln] = len(it.get("phones", []))
+            line_texts[ln] = str(it.get("text", ""))
+    out: List[ExternalWavInspection] = []
+    for wav_name, lo, hi in ranges:
+        wav_path = project.external_dir / wav_name
+        if not wav_path.is_file() or lo > hi:
+            continue
+        out.append(
+            inspect_external_wav(
+                wav_path,
+                list(range(lo, hi + 1)),
+                line_phone_counts=phone_counts,
+                line_texts=line_texts,
+            )
+        )
+    return out
 
 
 def _token_for_line(item: Dict[str, object]) -> str:
@@ -354,13 +692,25 @@ def _save_segments_csv(path: Path, rows_by_line: Dict[int, Dict[str, object]]) -
 def audit_aligned_clips(
     project: VoiceProject,
     token_meta: Dict[str, Dict[str, object]],
+    *,
+    warnings: Optional[Sequence[str]] = None,
 ) -> AlignmentReport:
     """Audit Pass-2 per-line TextGrids & clips to build the flagged-lines retake/pickup queue."""
     seg_rows = _load_segments_csv(project.segments_csv)
     by_line_meta = {int(v["line"]): (tok, v) for tok, v in token_meta.items()}
+    dismissed_set = {int(x) for x in getattr(project.config, "dismissed_flags", [])}
+    excluded_set = {int(x) for x in getattr(project.config, "excluded_lines", [])}
     flags: List[AuditFlag] = []
+    all_raw_flagged_lines: List[int] = []
     aligned_ok = 0
     phone_ok = 0
+    warn_list = list(warnings) if warnings is not None else []
+    if warnings is None and project.audit_file.is_file():
+        try:
+            prev_doc = json.loads(project.audit_file.read_text(encoding="utf-8"))
+            warn_list = list(prev_doc.get("warnings", []))
+        except Exception:
+            warn_list = []
 
     for ln in sorted(by_line_meta):
         tok, m = by_line_meta[ln]
@@ -369,18 +719,27 @@ def audit_aligned_clips(
         src_wav = seg_rows.get(ln, {}).get("source_wav", "")
         reasons: List[str] = []
 
+        if ln in excluded_set:
+            continue
+
         if not clip_path.is_file():
-            flags.append(AuditFlag(ln, str(m["text"]), str(m["kind"]), ["MISSING_CLIP"], src_wav, ""))
+            all_raw_flagged_lines.append(ln)
+            if ln not in dismissed_set:
+                flags.append(AuditFlag(ln, str(m["text"]), str(m["kind"]), ["MISSING_CLIP"], src_wav, ""))
             continue
         if not tg_path.is_file():
-            flags.append(AuditFlag(ln, str(m["text"]), str(m["kind"]), ["UNALIGNED"], src_wav, str(clip_path)))
+            all_raw_flagged_lines.append(ln)
+            if ln not in dismissed_set:
+                flags.append(AuditFlag(ln, str(m["text"]), str(m["kind"]), ["UNALIGNED"], src_wav, str(clip_path)))
             continue
 
         tiers = parse_textgrid(tg_path)
         wivs = [w for w in tiers.get("words", []) if w["text"]]
         pivs = [p for p in tiers.get("phones", []) if p["text"] and p["text"] not in ("sil", "sp", "spn")]
         if not wivs:
-            flags.append(AuditFlag(ln, str(m["text"]), str(m["kind"]), ["NO_WORD_ALIGNED"], src_wav, str(clip_path)))
+            all_raw_flagged_lines.append(ln)
+            if ln not in dismissed_set:
+                flags.append(AuditFlag(ln, str(m["text"]), str(m["kind"]), ["NO_WORD_ALIGNED"], src_wav, str(clip_path)))
             continue
 
         aligned_ok += 1
@@ -398,7 +757,7 @@ def audit_aligned_clips(
         audio, sr = sf.read(str(clip_path), dtype="float32", always_2d=True)
         mono = audio[:, 0] if audio.shape[1] == 1 else audio.mean(axis=1)
         peak = float(np.max(np.abs(mono))) if len(mono) else 0.0
-        if peak >= 0.99:
+        if peak >= 0.995:
             reasons.append(f"CLIPPED(peak={peak:.2f})")
 
         frame_db, noise_p10 = compute_frame_db(mono, sr)
@@ -406,20 +765,26 @@ def audit_aligned_clips(
         word_rms = 20.0 * math.log10(max(float(np.sqrt(np.mean(mono[i0:i1].astype(np.float64) ** 2))), 1e-12)) if i1 > i0 else -120.0
         if word_rms < noise_p10 + 10.0:
             reasons.append(f"LOW_SNR({word_rms - noise_p10:.1f}dB)")
-        if (w1 - w0) < 0.12:
+        if (w1 - w0) < 0.10:
             reasons.append(f"TOO_SHORT({w1 - w0:.2f}s)")
         max_pd = max(((float(p["xmax"]) - float(p["xmin"])) * 1000.0 for p in w_phones), default=0.0)
         if max_pd > 550.0:
             reasons.append(f"LONG_PHONE_OR_SILENCE_LEAK({max_pd:.0f}ms)")
 
         if reasons:
-            flags.append(AuditFlag(ln, str(m["text"]), str(m["kind"]), reasons, src_wav, str(clip_path)))
+            all_raw_flagged_lines.append(ln)
+            if ln not in dismissed_set:
+                flags.append(AuditFlag(ln, str(m["text"]), str(m["kind"]), reasons, src_wav, str(clip_path)))
 
     audit_doc = {
         "total_lines": len(by_line_meta),
         "aligned_lines": aligned_ok,
         "phone_ok_lines": phone_ok,
         "flagged_count": len(flags),
+        "dismissed_lines": sorted(dismissed_set),
+        "excluded_lines": sorted(excluded_set),
+        "raw_flagged_lines": sorted(all_raw_flagged_lines),
+        "warnings": warn_list,
         "flags": [
             {
                 "line": f.line,
@@ -439,7 +804,18 @@ def audit_aligned_clips(
         phone_ok_lines=phone_ok,
         flags=flags,
         phone_map_approximate=[],
+        warnings=warn_list,
     )
+
+
+def re_audit_project(project: VoiceProject) -> Optional[AlignmentReport]:
+    """Recompute `audit.json` immediately after dismissing flags or excluding lines (no MFA rerun)."""
+    if not project.token_meta_file.is_file():
+        return None
+    full_meta = json.loads(project.token_meta_file.read_text(encoding="utf-8"))
+    rep = audit_aligned_clips(project, full_meta)
+    project.set_stage("align", "done" if not rep.flags else "flagged")
+    return rep
 
 
 def _prepare_mfa_and_map(
@@ -465,7 +841,7 @@ def _prepare_mfa_and_map(
 
 
 def find_unaligned_mic_lines(project: VoiceProject) -> List[int]:
-    """Return planned line numbers that have a recorded mic take WAV but no TextGrid yet."""
+    """Return planned line numbers that have a new or re-recorded mic take WAV needing alignment."""
     dmap_path = project.plan_dir / "diphone_map.json"
     if not dmap_path.is_file():
         return []
@@ -475,9 +851,46 @@ def find_unaligned_mic_lines(project: VoiceProject) -> List[int]:
         ln = int(it["line"])
         take_wav = project.takes_dir / f"line_{ln:04d}.wav"
         tg_path = project.mfa_aligned_dir / f"line_{ln:04d}.TextGrid"
-        if take_wav.is_file() and take_wav.stat().st_size > 1000 and not tg_path.is_file():
-            out.append(ln)
+        if take_wav.is_file() and take_wav.stat().st_size > 1000:
+            if (not tg_path.is_file()) or (take_wav.stat().st_mtime > tg_path.stat().st_mtime + 0.5):
+                out.append(ln)
     return sorted(out)
+
+
+def _trim_mic_take_silence(
+    mono: np.ndarray,
+    sr: int,
+    *,
+    pad_s: float = 0.18,
+) -> Tuple[int, int]:
+    """Return `(start_sample, end_sample)` trimming excess outer silence while keeping `pad_s` margin.
+
+    Requires sustained speech (>= 3-4 consecutive active 10 ms frames) so isolated keyboard/mouse
+    clicks or breath pops before the word cannot prevent leading silence from being cropped.
+    """
+    n = len(mono)
+    if n < int(sr * 0.40):
+        return 0, n
+    frame_db, noise_p10 = compute_frame_db(mono, sr)
+    thresh = max(noise_p10 + 10.0, -48.0)
+    mask = (frame_db > thresh).astype(np.int32)
+    if len(mask) >= 4:
+        runs = np.convolve(mask, np.ones(4, dtype=np.int32), mode="same")
+        sustained = np.flatnonzero((mask > 0) & (runs >= 3))
+    else:
+        sustained = np.flatnonzero(mask > 0)
+    act = sustained if len(sustained) > 0 else np.flatnonzero(mask > 0)
+    if len(act) == 0:
+        return 0, n
+    a0 = int(act[0]) * 0.010
+    a1 = int(act[-1]) * 0.010 + 0.020
+    t0 = max(0.0, a0 - pad_s)
+    t1 = min(n / float(sr), a1 + pad_s)
+    s0 = max(0, int(round(t0 * sr)))
+    s1 = min(n, int(round(t1 * sr)))
+    if (s1 - s0) < int(sr * 0.25):
+        return 0, n
+    return s0, s1
 
 
 def align_mic_takes(
@@ -488,7 +901,7 @@ def align_mic_takes(
     progress: Optional[ProgressFn] = None,
     cancel: Optional[CancelFn] = None,
 ) -> AlignmentReport:
-    """Export built-in mic takes -> `align/segments/` and run Pass-2 per-line MFA directly."""
+    """Export built-in mic takes (trimmed cleanly with exact source_start_s mapping) -> Pass-2 MFA."""
     mfa_env, pm = _prepare_mfa_and_map(project, progress=progress, cancel=cancel)
     dict_lines, full_meta = _build_mfa_dict_and_meta(project, pm)
 
@@ -505,18 +918,24 @@ def align_mic_takes(
     project.segments_dir.mkdir(parents=True, exist_ok=True)
 
     rows_by_line = _load_segments_csv(project.segments_csv)
+    prepared_count = 0
     missing_takes = []
     for ln in target_lines:
         take_wav = project.takes_dir / f"line_{ln:04d}.wav"
-        if not take_wav.is_file():
+        if not take_wav.is_file() or take_wav.stat().st_size <= 1000:
             missing_takes.append(ln)
             continue
         tok, m = by_line[ln]
-        info = sf.info(str(take_wav))
-        dur = info.frames / float(info.samplerate)
+        audio, sr = sf.read(str(take_wav), dtype="float32", always_2d=True)
+        mono = audio[:, 0] if audio.shape[1] == 1 else audio.mean(axis=1)
+        raw_dur = len(mono) / float(sr)
+        s0, s1 = _trim_mic_take_silence(mono, sr, pad_s=0.18)
+        trimmed = mono[s0:s1]
+        trim_dur = len(trimmed) / float(sr)
+
         fname = f"line_{ln:04d}.wav"
-        shutil.copy2(take_wav, project.segments_dir / fname)
-        shutil.copy2(take_wav, pass2_dir / fname)
+        sf.write(str(project.segments_dir / fname), trimmed, sr, subtype="PCM_16")
+        sf.write(str(pass2_dir / fname), trimmed, sr, subtype="PCM_16")
         (pass2_dir / f"line_{ln:04d}.lab").write_text(f"{tok}\n", encoding="utf-8")
         rows_by_line[ln] = {
             "line": ln,
@@ -524,19 +943,23 @@ def align_mic_takes(
             "kind": m["kind"],
             "text": m["text"],
             "source_wav": f"takes/{fname}",
-            "source_start_s": "0.000000",
-            "source_end_s": f"{dur:.6f}",
-            "duration_s": f"{dur:.6f}",
-            "pass1_raw_dur_s": f"{dur:.4f}",
-            "trimmed_dur_s": f"{dur:.4f}",
+            "source_start_s": f"{s0 / float(sr):.6f}",
+            "source_end_s": f"{s1 / float(sr):.6f}",
+            "duration_s": f"{trim_dur:.6f}",
+            "pass1_raw_dur_s": f"{raw_dur:.4f}",
+            "trimmed_dur_s": f"{trim_dur:.4f}",
             "segment_wav": fname,
         }
+        prepared_count += 1
 
-    if missing_takes:
-        raise FileNotFoundError(f"Missing recorded takes for {len(missing_takes)} line(s): {missing_takes[:15]}")
+    if prepared_count == 0:
+        raise FileNotFoundError(
+            f"No recorded mic takes found to align (missing {len(missing_takes)} line(s): {missing_takes[:15]})."
+        )
 
     if progress:
-        progress(f"Preparing {len(target_lines)} mic take(s) for Pass-2 MFA...", 0.14)
+        miss_note = f" ({len(missing_takes)} skipped/unrecorded)" if missing_takes else ""
+        progress(f"Preparing {prepared_count} mic take(s){miss_note} for Pass-2 MFA...", 0.14)
     _save_segments_csv(project.segments_csv, rows_by_line)
 
     out_tmp = project.align_dir / "mfa_aligned_run"
@@ -548,7 +971,7 @@ def align_mic_takes(
         project.align_dir / "mfa_dict.txt",
         project.config.mfa_model,
         out_tmp,
-        num_jobs=min(num_jobs, max(1, len(target_lines))),
+        num_jobs=min(num_jobs, max(1, prepared_count)),
         beam=40,
         retry_beam=160,
         progress=progress,
@@ -573,7 +996,7 @@ def align_mic_takes(
     if changed_batches:
         project.save()
 
-    report = audit_aligned_clips(project, full_meta)
+    report = audit_aligned_clips(project, full_meta, warnings=[])
     report.phone_map_approximate = pm.approximate
     project.set_stage("align", "done" if not report.flags else "flagged")
     if progress:
@@ -581,43 +1004,126 @@ def align_mic_takes(
     return report
 
 
-def _slice_from_whole_textgrid(
-    src_wav_path: Path,
+def _trim_outer_in_window(
+    frame_db: np.ndarray,
+    t0: float,
+    t1: float,
+    speech_thresh: float,
+) -> Tuple[float, float]:
+    """Trim outer silence inside `[t0, t1]` using sustained speech (>= 3 active 10 ms frames)."""
+    f0 = max(0, int(t0 / 0.010))
+    f1 = min(len(frame_db), int(math.ceil(t1 / 0.010)))
+    if f1 <= f0:
+        return t0, t1
+    mask = (frame_db[f0:f1] > speech_thresh).astype(np.int32)
+    if len(mask) >= 4:
+        runs = np.convolve(mask, np.ones(4, dtype=np.int32), mode="same")
+        sustained = np.flatnonzero((mask > 0) & (runs >= 3))
+    else:
+        sustained = np.flatnonzero(mask > 0)
+    act = sustained if len(sustained) > 0 else np.flatnonzero(mask > 0)
+    if len(act) == 0:
+        return t0, t1
+    a0 = (f0 + int(act[0])) * 0.010
+    a1 = (f0 + int(act[-1])) * 0.010 + 0.020
+    return max(t0, a0 - 0.040), min(t1, a1 + 0.040)
+
+
+def _check_pass1_drift(
+    wav_name: str,
+    mapped_words: Sequence[Tuple[str, float, float]],
+    strict_utts: Sequence[Tuple[float, float, float]],
+    mono: np.ndarray,
+    sr: int,
+    noise_p10: float,
+    token_meta: Dict[str, Dict[str, object]],
+) -> List[str]:
+    """Post-Pass-1 sanity checks catching beam collapse, abandoned audio tails, or swallowed words."""
+    warnings: List[str] = []
+    if not mapped_words:
+        warnings.append(f"{wav_name}: Pass-1 produced 0 aligned words.")
+        return warnings
+
+    # 1. Check for abandoned trailing spoken audio (> max(5%, 10 s) of utterances left unaligned)
+    if strict_utts:
+        last_speech_end = strict_utts[-1][1]
+        first_speech_start = strict_utts[0][0]
+        speech_span = max(1.0, last_speech_end - first_speech_start)
+        last_aligned_end = max(re_ for _, _, re_ in mapped_words)
+        unaligned_tail = last_speech_end - last_aligned_end
+        if unaligned_tail > max(10.0, 0.05 * speech_span):
+            warnings.append(
+                f"{wav_name}: Pass-1 alignment stopped at {last_aligned_end:.1f} s, leaving "
+                f"{unaligned_tail:.1f} s of spoken audio unaligned (last speech at {last_speech_end:.1f} s). "
+                "Check for skipped words or range mismatch."
+            )
+
+    # 2. Check for words swallowing multiple utterances (> 2.8 s and overlapping >= 2 strict utterances)
+    swallowed: List[Tuple[int, float, float]] = []
+    for tok, rs, re_ in mapped_words:
+        if (re_ - rs) > 2.8:
+            ov = sum(1 for u0, u1, _ in strict_utts if min(re_, u1) - max(rs, u0) > 0.12)
+            if ov >= 2:
+                ln = int(token_meta[tok]["line"]) if tok in token_meta else -1
+                swallowed.append((ln, rs, re_ - rs))
+    if len(swallowed) >= max(3, int(0.03 * len(mapped_words))):
+        ln0, t0, d0 = swallowed[0]
+        warnings.append(
+            f"{wav_name}: {len(swallowed)} aligned word(s) swallowed multiple spoken utterances "
+            f"(first at line {ln0}, {t0:.1f} s, span {d0:.1f} s) — indicates alignment drift."
+        )
+
+    # 3. Check for many words landing on pure silence
+    silent_lines: List[Tuple[int, float]] = []
+    for tok, rs, re_ in mapped_words:
+        s0 = max(0, int(rs * sr))
+        s1 = min(len(mono), int(re_ * sr))
+        if s1 <= s0:
+            rms_db = -120.0
+        else:
+            rms_db = 20.0 * math.log10(max(float(np.sqrt(np.mean(mono[s0:s1].astype(np.float64) ** 2))), 1e-12))
+        if rms_db < noise_p10 + 8.0:
+            ln = int(token_meta[tok]["line"]) if tok in token_meta else -1
+            silent_lines.append((ln, rs))
+    if len(silent_lines) >= max(5, int(0.05 * len(mapped_words))):
+        ln0, t0 = silent_lines[0]
+        warnings.append(
+            f"{wav_name}: {len(silent_lines)} word(s) aligned onto silence (first at line {ln0}, {t0:.1f} s)."
+        )
+
+    return warnings
+
+
+def _slice_mapped_words_to_clips(
+    mono: np.ndarray,
+    sr: int,
     rel_source_wav: str,
-    tg_path: Path,
+    mapped_words: Sequence[Tuple[str, float, float]],
     token_meta: Dict[str, Dict[str, object]],
     segments_dir: Path,
     pass2_dir: Path,
     *,
     pad_s: float = 0.14,
+    noise_p10: Optional[float] = None,
+    speech_ref: Optional[float] = None,
 ) -> Dict[int, Dict[str, object]]:
-    tiers = parse_textgrid(tg_path)
-    word_ivs = [iv for iv in tiers.get("words", []) if iv["text"]]
-    audio, sr = sf.read(str(src_wav_path), dtype="float32", always_2d=True)
-    mono = audio[:, 0] if audio.shape[1] == 1 else audio.mean(axis=1)
+    """Trim outer silence using speech-anchored threshold, slice exact clips from `mono`, write Pass-2 corpus."""
     total_dur = len(mono) / float(sr)
-    frame_db, noise_p10 = compute_frame_db(mono, sr)
-    speech_thresh = noise_p10 + 12.0
+    frame_db, calc_p10 = compute_frame_db(mono, sr)
+    np10 = calc_p10 if noise_p10 is None else noise_p10
+    if speech_ref is None:
+        above = frame_db[frame_db > np10 + 12.0]
+        sref = float(np.percentile(above, 85)) if len(above) >= 10 else float(np.percentile(frame_db, 95))
+    else:
+        sref = speech_ref
+    # Anchor to speech level (avoids -52 dB breath leaks on quiet external recorders)
+    speech_thresh = max(np10 + 10.0, sref - 24.0)
 
-    def trim_outer(t0: float, t1: float) -> Tuple[float, float]:
-        f0 = max(0, int(t0 / 0.010))
-        f1 = min(len(frame_db), int(math.ceil(t1 / 0.010)))
-        if f1 <= f0:
-            return t0, t1
-        act = np.flatnonzero(frame_db[f0:f1] > speech_thresh)
-        if len(act) == 0:
-            return t0, t1
-        a0 = (f0 + int(act[0])) * 0.010
-        a1 = (f0 + int(act[-1])) * 0.010 + 0.020
-        return max(t0, a0 - 0.040), min(t1, a1 + 0.040)
-
-    trimmed = []
-    for wiv in word_ivs:
-        tok = str(wiv["text"])
+    trimmed: List[Tuple[str, float, float, float, float]] = []
+    for tok, rs, re_ in mapped_words:
         if tok not in token_meta:
             continue
-        rs, re_ = float(wiv["xmin"]), float(wiv["xmax"])
-        ts, te = trim_outer(rs, re_)
+        ts, te = _trim_outer_in_window(frame_db, rs, re_, speech_thresh)
         trimmed.append((tok, rs, re_, ts, te))
 
     rows: Dict[int, Dict[str, object]] = {}
@@ -628,6 +1134,9 @@ def _slice_from_whole_textgrid(
         next_start = trimmed[i + 1][3] if i + 1 < len(trimmed) else total_dur
         clip_s = max(0.0, ts - pad_s, 0.5 * (prev_end + ts) if i > 0 else 0.0)
         clip_e = min(total_dur, te + pad_s, 0.5 * (te + next_start) if i + 1 < len(trimmed) else total_dur)
+        if clip_e <= clip_s:
+            clip_s = max(0.0, min(total_dur, rs))
+            clip_e = max(clip_s + 0.02, min(total_dur, re_))
 
         s_idx = int(round(clip_s * sr))
         e_idx = int(round(clip_e * sr))
@@ -653,6 +1162,386 @@ def _slice_from_whole_textgrid(
     return rows
 
 
+def _slice_from_vad_utterances(
+    mono: np.ndarray,
+    sr: int,
+    rel_source_wav: str,
+    utterances: Sequence[Tuple[float, float, float]],
+    ordered_lines: Sequence[int],
+    by_line: Dict[int, Tuple[str, Dict[str, object]]],
+    segments_dir: Path,
+    pass2_dir: Path,
+    *,
+    pad_s: float = 0.14,
+) -> Dict[int, Dict[str, object]]:
+    """Slice isolated 1-to-1 spoken utterances directly from `mono` into Pass-2 clips (zero Pass-1 drift)."""
+    total_dur = len(mono) / float(sr)
+    rows: Dict[int, Dict[str, object]] = {}
+    for i, ln in enumerate(ordered_lines):
+        tok, m = by_line[ln]
+        ts, te, _ = utterances[i]
+        prev_end = utterances[i - 1][1] if i > 0 else 0.0
+        next_start = utterances[i + 1][0] if i + 1 < len(utterances) else total_dur
+        clip_s = max(0.0, ts - pad_s, 0.5 * (prev_end + ts) if i > 0 else 0.0)
+        clip_e = min(total_dur, te + pad_s, 0.5 * (te + next_start) if i + 1 < len(utterances) else total_dur)
+
+        s_idx = int(round(clip_s * sr))
+        e_idx = int(round(clip_e * sr))
+        clip = mono[s_idx:e_idx]
+        fname = f"line_{ln:04d}.wav"
+        sf.write(str(segments_dir / fname), clip, sr, subtype="PCM_16")
+        sf.write(str(pass2_dir / fname), clip, sr, subtype="PCM_16")
+        (pass2_dir / f"line_{ln:04d}.lab").write_text(f"{tok}\n", encoding="utf-8")
+
+        rows[ln] = {
+            "line": ln,
+            "token": tok,
+            "kind": m["kind"],
+            "text": m["text"],
+            "source_wav": rel_source_wav,
+            "source_start_s": f"{s_idx / sr:.6f}",
+            "source_end_s": f"{e_idx / sr:.6f}",
+            "duration_s": f"{(e_idx - s_idx) / sr:.6f}",
+            "pass1_raw_dur_s": f"{te - ts:.4f}",
+            "trimmed_dur_s": f"{te - ts:.4f}",
+            "segment_wav": fname,
+        }
+    return rows
+
+
+def _plan_vad_pass1_chunks(
+    strict_utts: Sequence[Tuple[float, float, float]],
+    loose_utts: Sequence[Tuple[float, float, float]],
+    ordered_lines: Sequence[int],
+    by_line: Dict[int, Tuple[str, Dict[str, object]]],
+    *,
+    target_chunk_lines: int = 50,
+) -> List[Tuple[int, int, int, int]]:
+    """Split `(ordered_lines, loose_utts)` into ~50-word chunks only at high-confidence shift-verified boundaries.
+
+    Returns list of `(line_start, line_end, loose_start, loose_end)` half-open index tuples.
+    """
+    n_lines = len(ordered_lines)
+    n_loose = len(loose_utts)
+    if n_lines <= 65 or len(strict_utts) < 25:
+        return [(0, n_lines, 0, n_loose)]
+
+    # Map each strict utterance to its matching loose utterance index
+    strict_to_loose: List[int] = []
+    l_ptr = 0
+    for s0, s1, _ in strict_utts:
+        while l_ptr + 1 < n_loose and loose_utts[l_ptr][1] < s0 - 0.02:
+            l_ptr += 1
+        best_l = l_ptr
+        best_ov = -1.0
+        for cand in range(max(0, l_ptr - 1), min(n_loose, l_ptr + 3)):
+            ov = min(s1, loose_utts[cand][1]) - max(s0, loose_utts[cand][0])
+            if ov > best_ov:
+                best_ov = ov
+                best_l = cand
+        strict_to_loose.append(best_l)
+
+    durs = np.array([e - s for s, e, _ in strict_utts], dtype=np.float64)
+    nph = np.array([max(1, len(by_line[ln][1]["phones"])) for ln in ordered_lines], dtype=np.float64)
+    m_strict = len(strict_utts)
+    max_sh = max(2, min(12, abs(m_strict - n_lines) + 3))
+
+    def _window_shift(j_center: int, half_w: int = 16) -> Optional[int]:
+        """Return confident shift `sh = line_idx - strict_idx` centered around line `j_center`, or None."""
+        scores: List[Tuple[float, int]] = []
+        for sh in range(-max_sh, max_sh + 1):
+            s_c = j_center - sh
+            s0 = max(0, s_c - half_w)
+            s1 = min(m_strict, s_c + half_w)
+            j0 = s0 + sh
+            j1 = s1 + sh
+            if j0 < 0:
+                s0 -= j0
+                j0 = 0
+            if j1 > n_lines:
+                s1 -= (j1 - n_lines)
+                j1 = n_lines
+            if (s1 - s0) < 14:
+                continue
+            r = _safe_corr(durs[s0:s1], nph[j0:j1])
+            scores.append((r, sh))
+        if not scores:
+            return None
+        scores.sort(reverse=True)
+        best_r, best_sh = scores[0]
+        second_r = scores[1][0] if len(scores) > 1 else -1.0
+        if best_r >= 0.35 and (best_r - second_r) >= 0.14:
+            return best_sh
+        return None
+
+    cuts: List[Tuple[int, int]] = [(0, 0)]
+    j_next = target_chunk_lines
+    while j_next <= n_lines - 25:
+        placed = False
+        for delta_j in (0, -6, 6, -12, 12):
+            jc = j_next + delta_j
+            if jc <= cuts[-1][0] + 20 or jc >= n_lines - 20:
+                continue
+            sh_l = _window_shift(jc - 10, half_w=14)
+            sh_c = _window_shift(jc, half_w=14)
+            sh_r = _window_shift(jc + 10, half_w=14)
+            if sh_c is not None and sh_l == sh_c and sh_r == sh_c:
+                s_idx = jc - sh_c
+                if 0 < s_idx < m_strict:
+                    l_idx = strict_to_loose[s_idx]
+                    if l_idx > cuts[-1][1] and l_idx < n_loose:
+                        cuts.append((jc, l_idx))
+                        j_next = jc + target_chunk_lines
+                        placed = True
+                        break
+        if not placed:
+            j_next += target_chunk_lines
+
+    cuts.append((n_lines, n_loose))
+    return [
+        (cuts[k][0], cuts[k + 1][0], cuts[k][1], cuts[k + 1][1])
+        for k in range(len(cuts) - 1)
+    ]
+
+
+def _align_wav_pass1(
+    mfa_env: Path,
+    model_name: str,
+    dict_path: Path,
+    wav_path: Path,
+    rel_source_wav: str,
+    ordered_lines: Sequence[int],
+    by_line: Dict[int, Tuple[str, Dict[str, object]]],
+    full_meta: Dict[str, Dict[str, object]],
+    inspection: ExternalWavInspection,
+    work_dir: Path,
+    segments_dir: Path,
+    pass2_dir: Path,
+    *,
+    tag: str,
+    pad_s: float = 0.14,
+    num_jobs: int = 4,
+    progress: Optional[ProgressFn] = None,
+    cancel: Optional[CancelFn] = None,
+    progress_start: float = 0.14,
+    progress_end: float = 0.54,
+) -> Tuple[Dict[int, Dict[str, object]], List[str]]:
+    """Align one external/pickup WAV into per-line clips via Direct-VAD (exact) or Condensed Chunked Pass-1."""
+    audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+    mono = audio[:, 0] if audio.shape[1] == 1 else audio.mean(axis=1)
+    total_dur = len(mono) / float(sr) if sr > 0 else 0.0
+    warnings: List[str] = []
+
+    # --- Tier 1: Exact isolated-word match -> Direct VAD Slicing (skip Pass-1 completely!) ---
+    if inspection.direct_vad_ok:
+        if progress:
+            progress(
+                f"{wav_path.name}: {inspection.detected_count}/{inspection.expected_count} spoken words "
+                f"matched 1-to-1 — slicing directly (drift-free)...",
+                progress_end,
+            )
+        rows = _slice_from_vad_utterances(
+            mono,
+            sr,
+            rel_source_wav,
+            inspection.utterances,
+            ordered_lines,
+            by_line,
+            segments_dir,
+            pass2_dir,
+            pad_s=pad_s,
+        )
+        return rows, warnings
+
+    # Record pre-flight mismatch/shift info as a helpful warning
+    if inspection.delta != 0 or inspection.shift_warning:
+        detail = f" {inspection.shift_warning}" if inspection.shift_warning else ""
+        warnings.append(
+            f"{wav_path.name}: detected {inspection.detected_count} spoken utterance(s) for "
+            f"{inspection.expected_count} expected line(s) ({inspection.delta:+d}).{detail}"
+        )
+
+    whole_dir = work_dir / f"{tag}_whole"
+    aligned_whole = work_dir / f"{tag}_aligned"
+    for d in (whole_dir, aligned_whole):
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+
+    n_lines = len(ordered_lines)
+    loose = inspection.loose_utterances
+    use_condensed = (
+        len(loose) >= max(1, int(0.50 * n_lines))
+        and abs(len(loose) - n_lines) <= max(15, int(0.25 * n_lines))
+    )
+
+    g = math.gcd(16000, sr)
+    chunk_seg_maps: Dict[str, List[Tuple[float, float, float, float]]] = {}
+
+    if use_condensed:
+        chunks = _plan_vad_pass1_chunks(inspection.utterances, loose, ordered_lines, by_line)
+        if progress:
+            progress(
+                f"{wav_path.name}: mismatch detected ({inspection.detected_count}/{inspection.expected_count}) — "
+                f"preparing {len(chunks)} pause-condensed Pass-1 chunk(s)...",
+                progress_start,
+            )
+        for ci, (j0, j1, l0, l1) in enumerate(chunks):
+            cname = f"{tag}_c{ci:02d}"
+            pieces: List[np.ndarray] = []
+            seg_map: List[Tuple[float, float, float, float]] = []
+            cond_cursor = 0.0
+            for k in range(l0, l1):
+                u0, u1, _ = loose[k]
+                prev_u1 = loose[k - 1][1] if k > 0 else 0.0
+                next_u0 = loose[k + 1][0] if k + 1 < len(loose) else total_dur
+                s_t = max(0.0, u0 - 0.11, 0.5 * (prev_u1 + u0) if k > 0 else 0.0)
+                e_t = min(total_dur, u1 + 0.11, 0.5 * (u1 + next_u0) if k + 1 < len(loose) else total_dur)
+                s_i = int(round(s_t * sr))
+                e_i = int(round(e_t * sr))
+                seg = mono[s_i:e_i]
+                seg16 = resample_poly(seg, 16000 // g, sr // g).astype(np.float32) if sr != 16000 else seg
+                seg_dur = len(seg16) / 16000.0
+                pieces.append(seg16)
+                seg_map.append((cond_cursor, cond_cursor + seg_dur, s_i / float(sr), e_i / float(sr)))
+                cond_cursor += seg_dur
+            chunk_audio = np.concatenate(pieces) if pieces else np.zeros(1600, dtype=np.float32)
+            sf.write(str(whole_dir / f"{cname}.wav"), chunk_audio, 16000, subtype="PCM_16")
+            toks = [by_line[ln][0] for ln in ordered_lines[j0:j1]]
+            (whole_dir / f"{cname}.lab").write_text(" ".join(toks) + "\n", encoding="utf-8")
+            chunk_seg_maps[cname] = seg_map
+        p1_jobs = min(max(1, num_jobs), max(1, len(chunks)))
+    else:
+        # Tier 3: Continuous speech or severe mismatch -> whole-file Pass-1 with fixed trimmer & drift check
+        if progress:
+            progress(f"Resampling {wav_path.name} to 16 kHz mono for Pass-1 MFA...", progress_start)
+        mono16 = resample_poly(mono, 16000 // g, sr // g).astype(np.float32) if sr != 16000 else mono
+        sf.write(str(whole_dir / f"{tag}.wav"), mono16, 16000, subtype="PCM_16")
+        toks = [by_line[ln][0] for ln in ordered_lines]
+        (whole_dir / f"{tag}.lab").write_text(" ".join(toks) + "\n", encoding="utf-8")
+        p1_jobs = 1
+
+    _run_mfa_align(
+        mfa_env,
+        whole_dir,
+        dict_path,
+        model_name,
+        aligned_whole,
+        num_jobs=p1_jobs,
+        beam=100,
+        retry_beam=400,
+        progress=progress,
+        cancel=cancel,
+        label=f"Pass-1 MFA ({wav_path.name})",
+        progress_start=progress_start + 0.02,
+        progress_end=progress_end - 0.02,
+    )
+
+    mapped_words: List[Tuple[str, float, float]] = []
+    if use_condensed:
+        def _map_condensed_span(c0: float, c1: float, smap: Sequence[Tuple[float, float, float, float]]) -> Tuple[float, float]:
+            if not smap:
+                return c0, c1
+            overlaps: List[Tuple[float, int]] = []
+            for idx_s, (cs0, cs1, _os0, _os1) in enumerate(smap):
+                ov = min(c1, cs1) - max(c0, cs0)
+                if ov > 0.0:
+                    overlaps.append((ov, idx_s))
+            if not overlaps:
+                if c1 <= smap[0][0]:
+                    return smap[0][2], smap[0][2] + 0.02
+                return smap[-1][3] - 0.02, smap[-1][3]
+            substantial = [idx_s for ov, idx_s in overlaps if ov >= 0.08]
+            if not substantial:
+                best_idx = max(overlaps, key=lambda x: x[0])[1]
+                substantial = [best_idx]
+            first_k = substantial[0]
+            last_k = substantial[-1]
+            cs0_f, cs1_f, os0_f, os1_f = smap[first_k]
+            cs0_l, cs1_l, os0_l, os1_l = smap[last_k]
+            frac0 = max(0.0, min(1.0, (c0 - cs0_f) / max(1e-6, cs1_f - cs0_f)))
+            frac1 = max(0.0, min(1.0, (c1 - cs0_l) / max(1e-6, cs1_l - cs0_l)))
+            return os0_f + frac0 * (os1_f - os0_f), os0_l + frac1 * (os1_l - os0_l)
+
+        for cname in sorted(chunk_seg_maps):
+            tg_p = aligned_whole / f"{cname}.TextGrid"
+            if not tg_p.is_file():
+                warnings.append(f"{wav_path.name}: Pass-1 chunk {cname} did not produce a TextGrid.")
+                continue
+            tiers = parse_textgrid(tg_p)
+            smap = chunk_seg_maps[cname]
+            for wiv in tiers.get("words", []):
+                tok = str(wiv["text"])
+                if not tok or tok not in full_meta:
+                    continue
+                os0, os1 = _map_condensed_span(float(wiv["xmin"]), float(wiv["xmax"]), smap)
+                mapped_words.append((tok, os0, os1))
+    else:
+        tg_p = aligned_whole / f"{tag}.TextGrid"
+        if not tg_p.is_file():
+            raise RuntimeError(f"Pass-1 MFA did not produce TextGrid for {wav_path.name}")
+        tiers = parse_textgrid(tg_p)
+        for wiv in tiers.get("words", []):
+            tok = str(wiv["text"])
+            if tok and tok in full_meta:
+                mapped_words.append((tok, float(wiv["xmin"]), float(wiv["xmax"])))
+
+    drift_warnings = _check_pass1_drift(
+        wav_path.name,
+        mapped_words,
+        inspection.utterances,
+        mono,
+        sr,
+        inspection.noise_p10_db,
+        full_meta,
+    )
+    warnings.extend(drift_warnings)
+
+    rows = _slice_mapped_words_to_clips(
+        mono,
+        sr,
+        rel_source_wav,
+        mapped_words,
+        full_meta,
+        segments_dir,
+        pass2_dir,
+        pad_s=pad_s,
+        noise_p10=inspection.noise_p10_db,
+        speech_ref=inspection.speech_ref_db,
+    )
+    return rows, warnings
+
+
+def _slice_from_whole_textgrid(
+    src_wav_path: Path,
+    rel_source_wav: str,
+    tg_path: Path,
+    token_meta: Dict[str, Dict[str, object]],
+    segments_dir: Path,
+    pass2_dir: Path,
+    *,
+    pad_s: float = 0.14,
+) -> Dict[int, Dict[str, object]]:
+    tiers = parse_textgrid(tg_path)
+    mapped = [
+        (str(iv["text"]), float(iv["xmin"]), float(iv["xmax"]))
+        for iv in tiers.get("words", [])
+        if iv["text"] and str(iv["text"]) in token_meta
+    ]
+    audio, sr = sf.read(str(src_wav_path), dtype="float32", always_2d=True)
+    mono = audio[:, 0] if audio.shape[1] == 1 else audio.mean(axis=1)
+    return _slice_mapped_words_to_clips(
+        mono,
+        sr,
+        rel_source_wav,
+        mapped,
+        token_meta,
+        segments_dir,
+        pass2_dir,
+        pad_s=pad_s,
+    )
+
+
 def align_external_recordings(
     project: VoiceProject,
     *,
@@ -661,7 +1550,7 @@ def align_external_recordings(
     progress: Optional[ProgressFn] = None,
     cancel: Optional[CancelFn] = None,
 ) -> AlignmentReport:
-    """Full Pass-1 -> slice -> Pass-2 MFA pipeline for external recorder long WAV(s)."""
+    """Drift-proof alignment for external recorder WAV(s): Direct-VAD (exact) or Chunked Pass-1 -> Pass-2 MFA."""
     if not project.ranges_file.is_file():
         raise FileNotFoundError(f"Missing external range map: {project.ranges_file}")
 
@@ -672,76 +1561,76 @@ def align_external_recordings(
     raw_ranges = read_ranges_file(project.ranges_file)
     ranges = validate_external_ranges(raw_ranges, project.external_dir, sorted(by_line))
 
-    (project.align_dir / "mfa_dict.txt").write_text("\n".join(dict_lines) + "\n", encoding="utf-8")
+    dict_path = project.align_dir / "mfa_dict.txt"
+    dict_path.write_text("\n".join(dict_lines) + "\n", encoding="utf-8")
     project.token_meta_file.write_text(json.dumps(full_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    whole_dir = project.align_dir / "whole_corpus"
-    if whole_dir.exists():
-        shutil.rmtree(whole_dir)
-    whole_dir.mkdir(parents=True, exist_ok=True)
-
-    for r_i, (wav_name, lo, hi) in enumerate(ranges):
-        src_path = project.external_dir / wav_name
-        stem = Path(wav_name).stem
-        if progress:
-            frac = 0.08 + 0.06 * (r_i / float(max(1, len(ranges))))
-            progress(f"Resampling {wav_name} to 16 kHz mono for Pass-1 MFA...", frac)
-        audio, sr = sf.read(str(src_path), dtype="float32", always_2d=True)
-        mono = audio[:, 0] if audio.shape[1] == 1 else audio.mean(axis=1)
-        g = math.gcd(16000, sr)
-        mono16 = resample_poly(mono, 16000 // g, sr // g).astype(np.float32) if sr != 16000 else mono
-        sf.write(str(whole_dir / f"{stem}.wav"), mono16, 16000, subtype="PCM_16")
-        toks = [by_line[ln][0] for ln in range(lo, hi + 1)]
-        (whole_dir / f"{stem}.lab").write_text(" ".join(toks) + "\n", encoding="utf-8")
-
-    aligned_whole = project.align_dir / "aligned_whole"
-    _run_mfa_align(
-        mfa_env,
-        whole_dir,
-        project.align_dir / "mfa_dict.txt",
-        project.config.mfa_model,
-        aligned_whole,
-        num_jobs=1,
-        beam=100,
-        retry_beam=400,
-        progress=progress,
-        cancel=cancel,
-        label="Pass-1 MFA",
-        progress_start=0.14,
-        progress_end=0.50,
-    )
+    pass1_work = project.align_dir / "pass1_work"
+    if pass1_work.exists():
+        shutil.rmtree(pass1_work)
+    pass1_work.mkdir(parents=True, exist_ok=True)
 
     pass2_dir = project.align_dir / "mfa_pass2_corpus"
     if pass2_dir.exists():
         shutil.rmtree(pass2_dir)
     pass2_dir.mkdir(parents=True, exist_ok=True)
     project.segments_dir.mkdir(parents=True, exist_ok=True)
+    # Clear stale per-line TextGrids before a full external alignment
+    if project.mfa_aligned_dir.exists():
+        shutil.rmtree(project.mfa_aligned_dir)
+    project.mfa_aligned_dir.mkdir(parents=True, exist_ok=True)
+
+    phone_counts = {ln: len(v["phones"]) for ln, (_tok, v) in by_line.items()}
+    line_texts = {ln: str(v["text"]) for ln, (_tok, v) in by_line.items()}
 
     rows_by_line: Dict[int, Dict[str, object]] = {}
+    all_warnings: List[str] = []
+    n_ranges = max(1, len(ranges))
     for r_i, (wav_name, lo, hi) in enumerate(ranges):
-        stem = Path(wav_name).stem
-        tg_path = aligned_whole / f"{stem}.TextGrid"
-        if not tg_path.is_file():
-            raise RuntimeError(f"Pass-1 MFA did not produce TextGrid for {wav_name}")
+        if cancel and cancel():
+            raise CancelledError("Alignment cancelled by user.")
+        src_path = project.external_dir / wav_name
+        ordered_lines = list(range(lo, hi + 1))
+        p_start = 0.08 + 0.48 * (r_i / float(n_ranges))
+        p_end = 0.08 + 0.48 * ((r_i + 1) / float(n_ranges))
         if progress:
-            progress(f"Slicing {wav_name} into per-line clips...", 0.51 + 0.06 * (r_i / float(max(1, len(ranges)))))
-        sliced = _slice_from_whole_textgrid(
-            project.external_dir / wav_name,
+            progress(f"Inspecting spoken utterances in {wav_name} (lines {lo}-{hi})...", p_start)
+        insp = inspect_external_wav(
+            src_path,
+            ordered_lines,
+            line_phone_counts=phone_counts,
+            line_texts=line_texts,
+        )
+        sliced, wav_warnings = _align_wav_pass1(
+            mfa_env,
+            project.config.mfa_model,
+            dict_path,
+            src_path,
             f"external/{wav_name}",
-            tg_path,
+            ordered_lines,
+            by_line,
             full_meta,
+            insp,
+            pass1_work,
             project.segments_dir,
             pass2_dir,
+            tag=f"r{r_i:02d}_{Path(wav_name).stem}",
             pad_s=pad_s,
+            num_jobs=num_jobs_pass2,
+            progress=progress,
+            cancel=cancel,
+            progress_start=p_start + 0.01,
+            progress_end=p_end,
         )
         rows_by_line.update(sliced)
+        all_warnings.extend(wav_warnings)
 
     _save_segments_csv(project.segments_csv, rows_by_line)
 
     _run_mfa_align(
         mfa_env,
         pass2_dir,
-        project.align_dir / "mfa_dict.txt",
+        dict_path,
         project.config.mfa_model,
         project.mfa_aligned_dir,
         num_jobs=num_jobs_pass2,
@@ -756,7 +1645,7 @@ def align_external_recordings(
 
     if progress:
         progress("Auditing aligned clips...", 0.96)
-    report = audit_aligned_clips(project, full_meta)
+    report = audit_aligned_clips(project, full_meta, warnings=all_warnings)
     report.phone_map_approximate = pm.approximate
     project.set_stage("align", "done" if not report.flags else "flagged")
     if progress:
@@ -837,57 +1726,46 @@ def apply_pickup_recording(
     work = project.align_dir / "pickup_work" / tag
     if work.exists():
         shutil.rmtree(work)
-    whole_dir = work / "whole_corpus"
-    aligned_whole = work / "aligned_whole"
     pass2_dir = work / "mfa_pass2_corpus"
     aligned_p2 = work / "mfa_aligned"
-    for d in (whole_dir, aligned_whole, pass2_dir, aligned_p2):
+    for d in (pass2_dir, aligned_p2):
         d.mkdir(parents=True, exist_ok=True)
+    project.segments_dir.mkdir(parents=True, exist_ok=True)
 
     dict_path = work / "mfa_dict.txt"
     dict_path.write_text("\n".join(dict_lines) + "\n", encoding="utf-8")
 
-    # Resample pickup WAV for Pass-1 MFA
     if progress:
-        progress(f"Preparing pickup/extension recording ({len(ordered)} line(s))...", 0.10)
-    audio, sr = sf.read(str(dest_wav), dtype="float32", always_2d=True)
-    mono = audio[:, 0] if audio.shape[1] == 1 else audio.mean(axis=1)
-    g = math.gcd(16000, sr)
-    mono16 = resample_poly(mono, 16000 // g, sr // g).astype(np.float32) if sr != 16000 else mono
-    sf.write(str(whole_dir / f"{tag}.wav"), mono16, 16000, subtype="PCM_16")
-    toks = [by_line[ln][0] for ln in ordered]
-    (whole_dir / f"{tag}.lab").write_text(" ".join(toks) + "\n", encoding="utf-8")
-
-    _run_mfa_align(
-        mfa_env,
-        whole_dir,
-        dict_path,
-        project.config.mfa_model,
-        aligned_whole,
-        num_jobs=1,
-        beam=100,
-        retry_beam=400,
-        progress=progress,
-        cancel=cancel,
-        label=f"Pickup {tag} Pass-1",
-        progress_start=0.14,
-        progress_end=0.50,
+        progress(f"Inspecting pickup/extension recording ({len(ordered)} line(s))...", 0.10)
+    phone_counts = {ln: len(v["phones"]) for ln, (_tok, v) in by_line.items()}
+    line_texts = {ln: str(v["text"]) for ln, (_tok, v) in by_line.items()}
+    insp = inspect_external_wav(
+        dest_wav,
+        ordered,
+        line_phone_counts=phone_counts,
+        line_texts=line_texts,
     )
 
-    tg_whole = aligned_whole / f"{tag}.TextGrid"
-    if not tg_whole.is_file():
-        raise RuntimeError(f"Pickup Pass-1 MFA failed to align {dest_wav.name}")
-
-    if progress:
-        progress(f"Slicing {len(ordered)} pickup/extension line(s)...", 0.54)
-    patched_rows = _slice_from_whole_textgrid(
+    patched_rows, pickup_warnings = _align_wav_pass1(
+        mfa_env,
+        project.config.mfa_model,
+        dict_path,
         dest_wav,
         f"pickups/{dest_wav.name}",
-        tg_whole,
+        ordered,
+        by_line,
         full_meta,
+        insp,
+        work,
         project.segments_dir,
         pass2_dir,
+        tag=tag,
         pad_s=pad_s,
+        num_jobs=1,
+        progress=progress,
+        cancel=cancel,
+        progress_start=0.14,
+        progress_end=0.54,
     )
     if not patched_rows:
         raise RuntimeError(f"Pickup alignment yielded 0 aligned words from {dest_wav.name}")
@@ -898,7 +1776,7 @@ def apply_pickup_recording(
         dict_path,
         project.config.mfa_model,
         aligned_p2,
-        num_jobs=1,
+        num_jobs=min(4, max(1, len(patched_rows))),
         beam=40,
         retry_beam=160,
         progress=progress,
@@ -949,7 +1827,7 @@ def apply_pickup_recording(
         project.config.pickups.append({"id": tag, "lines": ordered, "wav": f"pickups/{dest_wav.name}", "applied": True})
     project.save()
 
-    report = audit_aligned_clips(project, merged_meta)
+    report = audit_aligned_clips(project, merged_meta, warnings=pickup_warnings)
     report.phone_map_approximate = pm.approximate
     project.set_stage("align", "done" if not report.flags else "flagged")
     if progress:

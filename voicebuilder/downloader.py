@@ -34,6 +34,7 @@ from .paths import (
     get_bin_cache_dir,
     get_cache_root,
     get_default_mfa_env_dir,
+    get_dictionaries_cache_dir,
     get_espeak_paths,
     get_mbrolator_binaries,
     get_mfa_inspect_cache_dir,
@@ -159,6 +160,58 @@ def ensure_wordlist(
                 continue
             raise
     raise RuntimeError(f"Could not download word list for {lang.id} ({lang.wordlist_code}): {last_err}")
+
+
+def ensure_dictionary(
+    lang: LanguageSpec,
+    *,
+    catalog: Optional[LanguageCatalog] = None,
+    progress: Optional[ProgressFn] = None,
+    cancel: Optional[CancelFn] = None,
+    force: bool = False,
+) -> Optional[Path]:
+    """Return cached Hunspell `.dic` path for `lang` (with companion `.aff`), or `None` if unavailable.
+
+    Never fails hard on network/404 errors — returns `None` so planning can fall back
+    gracefully to frequency heuristics when offline or for languages without a dictionary.
+    """
+    if not lang.dict_code:
+        return None
+    cat = catalog or LanguageCatalog()
+    dict_dir = get_dictionaries_cache_dir() / lang.dict_code.lower()
+    dic_path = dict_dir / "index.dic"
+    aff_path = dict_dir / "index.aff"
+
+    if not force and dic_path.is_file() and dic_path.stat().st_size > 1024:
+        _report(progress, f"Using cached dictionary: {lang.dict_code}", None)
+        return dic_path
+
+    dict_dir.mkdir(parents=True, exist_ok=True)
+    for dic_url, aff_url in cat.dictionary_url_pairs(lang.dict_code):
+        try:
+            _report(progress, f"Fetching Hunspell dictionary for {lang.name}...", None)
+            download_file_atomic(
+                dic_url, dic_path, progress=progress, cancel=cancel, label=f"{lang.dict_code}/index.dic"
+            )
+            try:
+                download_file_atomic(
+                    aff_url, aff_path, progress=progress, cancel=cancel, label=f"{lang.dict_code}/index.aff"
+                )
+            except Exception:
+                # `.aff` is helpful for inflections, but `.dic` alone still works if `.aff` fails
+                pass
+            return dic_path
+        except CancelledError:
+            raise
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                continue
+            _report(progress, f"Dictionary download skipped ({exc}); using heuristic word filter.", None)
+            return None
+        except Exception as exc:
+            _report(progress, f"Dictionary download skipped ({exc}); using heuristic word filter.", None)
+            return None
+    return None
 
 
 def ensure_micromamba(
@@ -552,7 +605,7 @@ def run_doctor(*, ignore_external_mfa: bool = False) -> List[ComponentStatus]:
         ComponentStatus(
             name="Montreal Forced Aligner (MFA)",
             ok=mfa is not None,
-            detail=f"Ready ({mfa})" if mfa else "Not installed yet (one-time ~2.4 GB on-demand setup)",
+            detail=f"Ready ({mfa})" if mfa else "Not installed yet (~415 MB download, ~2.4 GB installed)",
             path=str(mfa) if mfa else str(get_default_mfa_env_dir()),
             downloadable=True,
         )
@@ -560,13 +613,15 @@ def run_doctor(*, ignore_external_mfa: bool = False) -> List[ComponentStatus]:
 
     wl_dir = get_wordlists_cache_dir()
     wl_count = len(list(wl_dir.glob("*.txt"))) if wl_dir.is_dir() else 0
+    dict_dir = get_dictionaries_cache_dir()
+    dict_count = len(list(dict_dir.glob("*/index.dic"))) if dict_dir.is_dir() else 0
     ac_dir = get_mfa_root_dir() / "pretrained_models" / "acoustic"
     model_count = len(list(ac_dir.glob("*.zip"))) if ac_dir.is_dir() else 0
     statuses.append(
         ComponentStatus(
             name="Portable Cache",
             ok=True,
-            detail=f"{wl_count} word list(s), {model_count} MFA model(s) cached",
+            detail=f"{wl_count} word list(s), {dict_count} dictionary(s), {model_count} MFA model(s) cached",
             path=str(get_cache_root()),
             downloadable=False,
         )

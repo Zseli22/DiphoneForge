@@ -101,14 +101,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_init.add_argument("--rates", default="22050", help="Comma-separated sample rates (22050, 16000, or 22050,16000).")
     p_init.add_argument("--mode", choices=["mic", "external"], default="mic")
     p_init.add_argument("--wordlist", default="auto", help="'auto' (FrequencyWords) or path to custom text/wordlist.")
-    p_init.add_argument("--max-words", type=int, default=500)
+    p_init.add_argument("--max-words", type=int, default=0, help="Optional cap on real words (0 = auto-calculate).")
 
     p_plan = sub.add_parser("plan", help="Download word list (if auto) and generate hybrid recording script.")
     p_plan.add_argument("--project", type=Path, required=True)
 
-    p_ext = sub.add_parser("extend", help="Append extra real words to an existing plan for more diphone takes.")
+    p_ext = sub.add_parser("extend", help="Auto-calculate and append extra real words to reinforce low-take pairs.")
     p_ext.add_argument("--project", type=Path, required=True)
-    p_ext.add_argument("--extra-words", type=int, default=200)
+    p_ext.add_argument("--extra-words", type=int, default=0, help="Optional cap on extra words (0 = auto-calculate).")
     p_ext.add_argument("--min-takes", type=int, default=2)
 
     p_map = sub.add_parser("check-phonemap", help="Download MFA model on demand and verify eSpeak->MFA phone map.")

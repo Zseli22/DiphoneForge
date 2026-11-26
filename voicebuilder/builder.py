@@ -77,21 +77,56 @@ def _rewrite_verified_descriptor(
     rate: int,
     f0_median_hz: float,
 ) -> Path:
-    """Write `mb-<db_name>` using exact catalog `espeak_phonemes` and `espeak_lang_lines`."""
+    """Write `mb-<db_name>` using exact catalog `espeak_phonemes`, `espeak_lang_lines`, and calibrated `stressLength`."""
     pitch_low = max(55, int(round(f0_median_hz * 0.78)))
     pitch_high = max(pitch_low + 25, int(round(f0_median_hz * 1.15)))
     gender = "female" if f0_median_hz >= 165.0 else "male"
-    lang_block = "\n".join(project.config.espeak_lang_lines)
+    lang_lines = list(project.config.espeak_lang_lines)
+    lang_block = "\n".join(lang_lines)
+
+    # Preserve or auto-calibrate vowel stressLength using the verified catalog phoneme table
+    desc_path = voice_dir / f"mb-{db_name}"
+    stress_line: Optional[str] = None
+    if str(_TOOLS_DIR) not in sys.path:
+        sys.path.insert(0, str(_TOOLS_DIR))
+    try:
+        import build_word_mbrola_db as B
+        from .paths import find_preview_engine_dir
+
+        sample_words: List[str] = []
+        dmap_path = project.plan_dir / "diphone_map.json"
+        if dmap_path.is_file():
+            dmap_doc = json.loads(dmap_path.read_text(encoding="utf-8"))
+            sample_words = [str(it["text"]) for it in dmap_doc.get("lines", []) if it.get("kind") == "word"]
+        stress_line, _cal = B.calibrate_espeak_stress_length(
+            project.config.espeak_voice,
+            project.config.espeak_phonemes,
+            lang_lines,
+            voice_dir / db_name,
+            voice_dir / phtrans_name,
+            rate,
+            sample_words,
+            engine_dir=find_preview_engine_dir(),
+        )
+    except Exception:
+        # Fall back to any stressLength already written by build_word_mbrola_db.py
+        if desc_path.is_file():
+            for ln in desc_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if ln.strip().lower().startswith("stresslength "):
+                    stress_line = ln.strip()
+                    break
+
+    stress_block = f"{stress_line}\n" if stress_line else ""
     desc = (
         f"name {db_name}\n"
         f"{lang_block}\n"
         f"gender {gender}\n"
         f"\n"
         f"phonemes {project.config.espeak_phonemes}\n"
+        f"{stress_block}"
         f"pitch {pitch_low} {pitch_high}\n"
         f"mbrola {db_name} {phtrans_name} {rate}\n"
     )
-    desc_path = voice_dir / f"mb-{db_name}"
     desc_path.write_text(desc, encoding="utf-8")
     return desc_path
 
@@ -128,6 +163,17 @@ def refresh_unit_grid(
         segments = {int(r["line"]): r for r in csv.DictReader(f)}
 
     out_csv = project.build_dir / "unit_grid.csv"
+    flagged_lines: set[int] = set()
+    excluded_lines: set[int] = {int(x) for x in getattr(project.config, "excluded_lines", [])}
+    dismissed_lines: set[int] = {int(x) for x in getattr(project.config, "dismissed_flags", [])}
+    if project.audit_file.is_file():
+        try:
+            aud = json.loads(project.audit_file.read_text(encoding="utf-8"))
+            flagged_lines = {int(f["line"]) for f in aud.get("flags", [])} - dismissed_lines
+            excluded_lines |= {int(x) for x in aud.get("excluded_lines", [])}
+        except Exception:
+            pass
+
     rows, f0_stats = B.build_unit_grid(
         segments=segments,
         token_meta=token_meta,
@@ -136,6 +182,9 @@ def refresh_unit_grid(
         audio_dir=project.recordings_dir,
         vowels=set(inv["vowels"]),
         out_csv=out_csv,
+        ipa_map=dict(inv.get("ipa_map", {})),
+        flagged_lines=flagged_lines,
+        excluded_lines=excluded_lines,
     )
     project.config.speaker_f0_hz = round(float(f0_stats["median_hz"]), 2)
     project.save()
@@ -194,6 +243,11 @@ def build_voice_databases(
         ov_file = project.build_dir / "take_overrides.json"
         if ov_file.is_file():
             cmd.extend(["--take-overrides", str(ov_file)])
+        if project.audit_file.is_file():
+            cmd.extend(["--audit-json", str(project.audit_file)])
+        excl = [int(x) for x in getattr(project.config, "excluded_lines", [])]
+        if excl:
+            cmd.extend(["--excluded-lines", ",".join(str(x) for x in sorted(set(excl)))])
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         proc = subprocess.Popen(
             cmd,

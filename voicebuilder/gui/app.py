@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import wx
 
 from .. import __version__
+from ..builder import _db_name_for_rate
 from ..catalog import LanguageCatalog
 from ..project import VoiceProject
 from .align_panel import AlignPanel
@@ -20,8 +21,8 @@ from .worker import BackgroundTaskRunner
 
 
 STEP_TITLES = [
-    "0. Home & Setup",
-    "1. Language & Plan",
+    "0. Home",
+    "1. Plan",
     "2. Record / Import",
     "3. Align & Audit",
     "4. Build & Preview",
@@ -60,9 +61,9 @@ class WizardFrame(wx.Frame):
         super().__init__(
             None,
             title=f"DiphoneForge Voice Builder v{__version__}",
-            size=(920, 680),
+            size=(960, 700),
         )
-        self.SetMinSize((820, 600))
+        self.SetMinSize((840, 620))
         self.catalog = LanguageCatalog()
         self.project: Optional[VoiceProject] = None
         self.current_step: int = 0
@@ -78,11 +79,15 @@ class WizardFrame(wx.Frame):
         root_panel = wx.Panel(self)
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Top step indicator bar
+        # Top clickable/accessible step navigation bar (no & mnemonics so panel shortcuts never collide)
         step_row = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_step_banner = wx.StaticText(root_panel, label="")
-        self.lbl_step_banner.SetFont(self.lbl_step_banner.GetFont().Bold())
-        step_row.Add(self.lbl_step_banner, 1, wx.ALIGN_CENTER_VERTICAL)
+        self.step_buttons: List[wx.Button] = []
+        for idx, title in enumerate(STEP_TITLES):
+            btn = wx.Button(root_panel, label=title)
+            btn.SetName(STEP_FULL_NAMES[idx])
+            btn.Bind(wx.EVT_BUTTON, lambda _e, s=idx: self.go_to_step(s))
+            self.step_buttons.append(btn)
+            step_row.Add(btn, 1, wx.EXPAND | (wx.RIGHT if idx < len(STEP_TITLES) - 1 else 0), 6)
         main_sizer.Add(step_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 12)
         main_sizer.Add(wx.StaticLine(root_panel), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
 
@@ -104,7 +109,7 @@ class WizardFrame(wx.Frame):
 
         main_sizer.Add(self.book, 1, wx.EXPAND | wx.ALL, 12)
 
-        # Shared background task progress & log strip
+        # Shared background task progress & log strip (always visible for NVDA progress tracking)
         prog_box = wx.StaticBox(root_panel, label="Activity & Progress")
         prog_sizer = wx.StaticBoxSizer(prog_box, wx.VERTICAL)
         top_prog = wx.BoxSizer(wx.HORIZONTAL)
@@ -145,13 +150,55 @@ class WizardFrame(wx.Frame):
 
         if initial_project is not None:
             try:
-                self.set_project(VoiceProject.load(initial_project))
-                self.go_to_step(1)
+                proj = VoiceProject.load(initial_project)
+                self.set_project(proj)
+                self.go_to_step(self.smart_resume_step(proj))
             except Exception as exc:
                 wx.MessageBox(f"Could not open initial project:\n{exc}", "Open Error", wx.OK | wx.ICON_ERROR, parent=self)
                 self.go_to_step(0)
         else:
             self.go_to_step(0)
+
+    def smart_resume_step(self, proj: VoiceProject) -> int:
+        """Pick the most helpful wizard step when reopening an existing project."""
+        if not (proj.plan_dir / "diphone_map.json").is_file():
+            return 1
+        # Check if any voice DB is already built
+        active_rates = list(proj.config.rates or [22050])
+        for r in (22050, 16000):
+            for cand in (
+                _db_name_for_rate(proj.config.voice_id, r, active_rates),
+                _db_name_for_rate(proj.config.voice_id, r, [22050, 16000]),
+                proj.config.voice_id,
+            ):
+                if (proj.build_dir / cand / cand).is_file():
+                    return 4
+        if proj.segments_csv.is_file() and proj.audit_file.is_file():
+            return 3
+        return 2
+
+    def _step_unlocked(self, step: int) -> bool:
+        if step == 0:
+            return True
+        proj = self.project
+        if proj is None:
+            return False
+        if step == 1:
+            return True
+        has_plan = (proj.plan_dir / "diphone_map.json").is_file()
+        if step == 2:
+            return has_plan
+        if step == 3:
+            if not has_plan:
+                return False
+            if proj.segments_csv.is_file():
+                return True
+            has_takes = proj.takes_dir.is_dir() and any(p.stat().st_size > 1000 for p in proj.takes_dir.glob("line_*.wav"))
+            has_ext = proj.ranges_file.is_file()
+            return has_takes or has_ext
+        if step == 4:
+            return proj.segments_csv.is_file() and proj.audit_file.is_file()
+        return False
 
     def set_project(self, project: VoiceProject) -> None:
         self.project = project
@@ -163,10 +210,14 @@ class WizardFrame(wx.Frame):
         self.lbl_task.SetLabel(msg)
 
     def _update_step_banner(self) -> None:
-        parts = []
-        for idx, title in enumerate(STEP_TITLES):
-            parts.append(f"[{title}]" if idx == self.current_step else title)
-        self.lbl_step_banner.SetLabel("  ->  ".join(parts))
+        busy = self.runner.is_busy
+        base_font = self.GetFont()
+        bold_font = base_font.Bold()
+        for idx, (btn, title) in enumerate(zip(self.step_buttons, STEP_TITLES)):
+            is_cur = idx == self.current_step
+            btn.SetLabel(f"[{title}]" if is_cur else title)
+            btn.SetFont(bold_font if is_cur else base_font)
+            btn.Enable((not busy) and (is_cur or self._step_unlocked(idx)))
 
     def update_nav_buttons(self) -> None:
         busy = self.runner.is_busy
@@ -181,8 +232,15 @@ class WizardFrame(wx.Frame):
                 panel = self.panels[self.current_step]
                 can_next = bool(getattr(panel, "can_proceed", lambda: True)())
         self.btn_next.Enable(can_next)
+        self._update_step_banner()
 
-    def go_to_step(self, step: int, *, flagged_only: Optional[Sequence[int]] = None) -> None:
+    def go_to_step(
+        self,
+        step: int,
+        *,
+        flagged_only: Optional[Sequence[int]] = None,
+        unrecorded_only: bool = False,
+    ) -> None:
         if self.runner.is_busy:
             return
         old_panel = self.panels[self.current_step]
@@ -191,11 +249,10 @@ class WizardFrame(wx.Frame):
 
         self.current_step = max(0, min(len(self.panels) - 1, step))
         self.book.SetSelection(self.current_step)
-        self._update_step_banner()
 
         new_panel = self.panels[self.current_step]
-        if self.current_step == 2 and flagged_only is not None:
-            self.studio_panel.on_enter(flagged_only=flagged_only)
+        if self.current_step == 2 and (flagged_only is not None or unrecorded_only):
+            self.studio_panel.on_enter(flagged_only=flagged_only, unrecorded_only=unrecorded_only)
         elif hasattr(new_panel, "on_enter"):
             new_panel.on_enter()
 

@@ -2,6 +2,7 @@
 Voice_audio/
 output/
 cache/
+projects/
 
 # Build artefacts
 build/
